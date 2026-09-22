@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>IR Remote</title>
+  <link rel="stylesheet" href="static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <svg viewBox="0 0 24 24" class="brand-icon" aria-hidden="true"><path fill="currentColor" d="M12 0C8.96 0 6.21 1.23 4.22 3.22l1.41 1.41C7.26 3.01 9.51 2 12 2s4.74 1.01 6.36 2.64l1.41-1.41C17.79 1.23 15.04 0 12 0M7.05 6.05l1.41 1.41C9.37 6.56 10.62 6 12 6s2.63.56 3.54 1.46l1.41-1.41C15.68 4.78 13.93 4 12 4s-3.68.78-4.95 2.05M15 9H9c-.55 0-1 .45-1 1v12c0 .55.45 1 1 1h6c.55 0 1-.45 1-1V10c0-.55-.45-1-1-1m-1 2v1.5h-4V11zm-2 3a1.5 1.5 0 1 1 0 3 1.5 1.5 0 0 1 0-3m-2 5h1v1h-1zm3 0h1v1h-1zm-3 2h1v1h-1zm3 0h1v1h-1z"/></svg>
+      <span>IR Remote</span>
+    </div>
+    <label class="blaster-picker">
+      <span class="label">IR blaster</span>
+      <select id="blaster-select"></select>
+    </label>
+    <div class="topbar-actions">
+      <button class="icon-btn" id="refresh-btn" title="Re-scan blasters">⟳</button>
+      <button class="icon-btn" id="settings-btn" title="Settings">⚙</button>
+    </div>
+  </header>
+
+  <div id="banner" class="banner" hidden></div>
+
+  <main class="layout">
+    <aside class="sidebar">
+      <div class="sidebar-head">
+        <h2>Devices</h2>
+        <button class="btn small primary" id="new-device-btn">+ New</button>
+      </div>
+      <ul id="device-list" class="device-list"></ul>
+    </aside>
+    <section id="main" class="content"></section>
+  </main>
+
+  <dialog id="dialog"></dialog>
+  <div id="toasts" class="toasts"></div>
+
+  <script src="static/app.js"></script>
+</body>
+</html>

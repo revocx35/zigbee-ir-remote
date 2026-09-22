@@ -1,0 +1,523 @@
+"use strict";
+
+// All URLs are relative so the page works behind Home Assistant ingress.
+const TEMPLATES = [
+  { key: "blank", emoji: "➕", name: "Blank", controls: [] },
+  { key: "tv", emoji: "📺", name: "TV", controls: ["Power", "Volume Up", "Volume Down", "Mute", "Channel Up", "Channel Down", "Input", "Up", "Down", "Left", "Right", "OK", "Back", "Home", "Menu"] },
+  { key: "ac", emoji: "❄️", name: "Air conditioner", controls: ["Power On", "Power Off", "Temp Up", "Temp Down", "Mode", "Fan Speed", "Swing"] },
+  { key: "fan", emoji: "🌀", name: "Fan", controls: ["Power", "Speed Up", "Speed Down", "Oscillate", "Timer"] },
+  { key: "audio", emoji: "🔊", name: "Soundbar / Amp", controls: ["Power", "Volume Up", "Volume Down", "Mute", "Input"] },
+  { key: "projector", emoji: "📽️", name: "Projector", controls: ["Power On", "Power Off", "Input", "Menu", "OK", "Back"] },
+  { key: "light", emoji: "💡", name: "LED light", controls: ["On", "Off", "Brighter", "Dimmer", "Red", "Green", "Blue", "White"] },
+];
+const SUGGESTIONS = ["Power", "Power On", "Power Off", "Volume Up", "Volume Down", "Mute", "Channel Up", "Channel Down", "Input", "OK", "Back", "Home", "Menu", "Up", "Down", "Left", "Right", "Play", "Pause", "Stop"];
+
+const state = {
+  blasters: [],
+  devices: [],
+  learning: {},
+  options: { learn_timeout: 30 },
+  blasterId: localGet("blaster"),
+  deviceId: localGet("device"),
+};
+
+const $ = (sel, root = document) => root.querySelector(sel);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+function localGet(k) { try { return localStorage.getItem("irremote." + k); } catch { return null; } }
+function localSet(k, v) { try { v == null ? localStorage.removeItem("irremote." + k) : localStorage.setItem("irremote." + k, v); } catch { /* ignore */ } }
+
+// ------------------------------------------------------------------ API
+async function api(method, path, body) {
+  const res = await fetch("api/" + path, {
+    method,
+    headers: body !== undefined ? { "Content-Type": "application/json" } : {},
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { data = null; }
+  if (!res.ok) {
+    const err = new Error((data && data.error) || text || res.statusText);
+    err.status = res.status;
+    throw err;
+  }
+  return data;
+}
+
+async function load(refresh = false) {
+  const data = await api("GET", "state" + (refresh ? "?refresh=1" : ""));
+  Object.assign(state, {
+    blasters: data.blasters, devices: data.devices, learning: data.learning, options: data.options,
+  });
+  const banner = $("#banner");
+  if (!data.connected || data.error) {
+    banner.hidden = false;
+    banner.textContent = data.error || "Connecting to Home Assistant…";
+  } else if (!data.blasters.length) {
+    banner.hidden = false;
+    banner.textContent = "No IR blasters found. The app looks for Zigbee2MQTT devices with a “learned_ir_code” entity. You can also add a blaster by MQTT topic in Settings (⚙).";
+  } else {
+    banner.hidden = true;
+  }
+  if (!state.blasters.some((b) => b.id === state.blasterId)) {
+    state.blasterId = state.blasters[0]?.id ?? null;
+  }
+  render();
+}
+
+function toast(msg, error = false) {
+  const el = document.createElement("div");
+  el.className = "toast" + (error ? " error" : "");
+  el.textContent = msg;
+  $("#toasts").append(el);
+  setTimeout(() => el.remove(), error ? 6000 : 2500);
+}
+
+async function run(fn) {
+  try { return await fn(); } catch (e) { toast(e.message, true); throw e; }
+}
+
+// ------------------------------------------------------------------ helpers
+const blaster = (id) => state.blasters.find((b) => b.id === id);
+const currentDevices = () => state.devices.filter((d) => d.blaster_id === state.blasterId);
+const currentDevice = () => state.devices.find((d) => d.id === state.deviceId && d.blaster_id === state.blasterId);
+
+function selectBlaster(id) {
+  state.blasterId = id;
+  localSet("blaster", id);
+  if (!currentDevice()) selectDevice(currentDevices()[0]?.id ?? null, false);
+  render();
+}
+function selectDevice(id, rerender = true) {
+  state.deviceId = id;
+  localSet("device", id);
+  if (rerender) render();
+}
+
+// ------------------------------------------------------------------ rendering
+function render() {
+  renderBlasters();
+  renderDevices();
+  renderMain();
+}
+
+function renderBlasters() {
+  const sel = $("#blaster-select");
+  const orphans = [...new Set(state.devices.map((d) => d.blaster_id))].filter((id) => !blaster(id));
+  sel.innerHTML = state.blasters.map((b) =>
+    `<option value="${esc(b.id)}">${esc(b.name)}${b.model ? " — " + esc(b.model) : ""}</option>`).join("")
+    + orphans.map((id) => `<option value="${esc(id)}">⚠ Missing blaster (${esc(id.slice(0, 8))})</option>`).join("")
+    || `<option value="">No blasters found</option>`;
+  sel.value = state.blasterId ?? "";
+  sel.disabled = !state.blasters.length && !orphans.length;
+  $("#new-device-btn").disabled = !blaster(state.blasterId);
+}
+
+function renderDevices() {
+  const list = $("#device-list");
+  const devs = currentDevices();
+  if (!currentDevice() && devs.length) state.deviceId = devs[0].id;
+  if (!devs.length) {
+    list.innerHTML = `<li class="empty">${state.blasterId ? "No devices on this blaster yet." : "Select an IR blaster first."}</li>`;
+    return;
+  }
+  list.innerHTML = devs.map((d) => {
+    const learned = d.controls.filter((c) => c.code).length;
+    return `<li data-id="${esc(d.id)}" class="${d.id === state.deviceId ? "active" : ""}">
+      <span>${esc(d.name)}</span><span class="count">${learned}/${d.controls.length}</span></li>`;
+  }).join("");
+}
+
+function renderMain() {
+  const main = $("#main");
+  const b = blaster(state.blasterId);
+  const dev = currentDevice();
+  if (!state.blasterId) {
+    main.innerHTML = `<div class="empty-state"><h2>No IR blaster selected</h2>
+      <p>Pair a Zigbee IR blaster (e.g. Tuya ZS06 / Moes UFO-R11) with Zigbee2MQTT and it will show up here automatically.</p></div>`;
+    return;
+  }
+  if (!dev) {
+    main.innerHTML = `<div class="empty-state"><h2>Create your first device</h2>
+      <p>A device is something you control with an IR remote — a TV, air conditioner, fan… Add it, then learn each button from its original remote.</p>
+      <button class="btn primary" data-action="new-device" ${b ? "" : "disabled"}>+ New device</button></div>`;
+    return;
+  }
+  const learned = dev.controls.filter((c) => c.code).length;
+  const pct = dev.controls.length ? Math.round((learned / dev.controls.length) * 100) : 0;
+  const nextUnlearned = dev.controls.find((c) => !c.code);
+  main.innerHTML = `
+    <div class="device-head">
+      <div>
+        <h1>${esc(dev.name)}</h1>
+        <div class="sub">via ${b ? esc(b.name) + ` · <code>${esc(b.topic)}</code>` : "⚠ blaster not found — edit the device to pick another"}</div>
+      </div>
+      <div class="actions">
+        ${nextUnlearned ? `<button class="btn primary" data-action="learn" data-id="${esc(nextUnlearned.id)}">Learn next: ${esc(nextUnlearned.name)}</button>` : ""}
+        <button class="btn" data-action="edit-device">Edit device</button>
+      </div>
+    </div>
+    ${dev.controls.length ? `<div class="progress-line"><div class="progress"><div style="width:${pct}%"></div></div>${learned} of ${dev.controls.length} controls learned</div>` : ""}
+    <div class="controls-grid" id="controls-grid">
+      ${dev.controls.map((c) => controlTile(c, !!b)).join("")}
+    </div>
+    ${dev.controls.length ? "" : `<p class="hint">No controls yet. Add the buttons you want to learn below.</p>`}
+    <form class="add-control" id="add-control-form">
+      <input name="name" placeholder="New control name, e.g. Power" autocomplete="off" maxlength="80">
+      <button class="btn" type="submit" name="mode" value="add">Add</button>
+      <button class="btn primary" type="submit" name="mode" value="learn" ${b ? "" : "disabled"}>Add &amp; learn</button>
+    </form>
+    <div class="chips">${SUGGESTIONS.filter((s) => !dev.controls.some((c) => c.name.toLowerCase() === s.toLowerCase()))
+      .map((s) => `<button class="chip" data-action="suggest" data-name="${esc(s)}">+ ${esc(s)}</button>`).join("")}</div>`;
+}
+
+function controlTile(c, hasBlaster) {
+  const when = c.learned_at ? new Date(c.learned_at * 1000).toLocaleString() : null;
+  return `<div class="control" draggable="true" data-id="${esc(c.id)}">
+    <div class="control-top">
+      <span class="handle" title="Drag to reorder">⋮⋮</span>
+      <span class="dot ${c.code ? "ok" : ""}"></span>
+      <span class="control-name" title="${esc(c.name)}">${esc(c.name)}</span>
+    </div>
+    <div class="control-status">${c.code ? (when ? "Learned " + esc(when) : "Code set") : "Not learned yet"}</div>
+    <div class="control-actions">
+      <button class="btn small ${c.code ? "" : "primary"}" data-action="learn" data-id="${esc(c.id)}" ${hasBlaster ? "" : "disabled"}>${c.code ? "Re-learn" : "Learn"}</button>
+      <button class="btn small" data-action="send" data-id="${esc(c.id)}" ${c.code && hasBlaster ? "" : "disabled"} title="Send this code">▶ Test</button>
+      <button class="btn small ghost" data-action="edit-control" data-id="${esc(c.id)}" title="Edit">✎</button>
+    </div>
+  </div>`;
+}
+
+// ------------------------------------------------------------------ dialogs
+const dlg = $("#dialog");
+
+function openDialog(html, onSubmit) {
+  dlg.innerHTML = html;
+  dlg.onclose = null;
+  const form = $("form", dlg);
+  if (form && onSubmit) {
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const btn = e.submitter;
+      if (btn?.value === "cancel") { dlg.close(); return; }
+      if (btn) btn.disabled = true;
+      try {
+        if ((await onSubmit(new FormData(form), btn?.value)) !== false) dlg.close();
+      } catch (err) {
+        toast(err.message, true);
+      } finally {
+        if (btn) btn.disabled = false;
+      }
+    });
+  }
+  if (!dlg.open) dlg.showModal();
+  $("[autofocus]", dlg)?.focus();
+}
+
+function blasterOptions(selected) {
+  return state.blasters.map((b) =>
+    `<option value="${esc(b.id)}" ${b.id === selected ? "selected" : ""}>${esc(b.name)}</option>`).join("");
+}
+
+function newDeviceDialog() {
+  let tpl = "tv";
+  openDialog(`<form method="dialog">
+    <div class="dlg-head">New IR device</div>
+    <div class="dlg-body">
+      <label>Name<input name="name" required maxlength="80" placeholder="Living room TV" autofocus></label>
+      <label>IR blaster<select name="blaster_id">${blasterOptions(state.blasterId)}</select></label>
+      <div><div class="hint" style="margin-bottom:6px">Start from a template (you can add/remove controls later)</div>
+        <div class="template-grid">${TEMPLATES.map((t) =>
+          `<button type="button" class="template ${t.key === tpl ? "selected" : ""}" data-tpl="${t.key}"><span class="emoji">${t.emoji}</span>${esc(t.name)}</button>`).join("")}</div>
+      </div>
+    </div>
+    <div class="dlg-foot">
+      <button class="btn" value="cancel" formnovalidate>Cancel</button>
+      <button class="btn primary" value="ok">Create</button>
+    </div></form>`, async (fd) => {
+    const t = TEMPLATES.find((x) => x.key === tpl);
+    const dev = await api("POST", "devices", { name: fd.get("name"), blaster_id: fd.get("blaster_id"), controls: t.controls });
+    state.devices.push(dev);
+    state.blasterId = dev.blaster_id;
+    localSet("blaster", dev.blaster_id);
+    selectDevice(dev.id);
+    renderBlasters();
+    toast(`Created “${dev.name}”`);
+  });
+  dlg.querySelectorAll(".template").forEach((el) => el.addEventListener("click", () => {
+    tpl = el.dataset.tpl;
+    dlg.querySelectorAll(".template").forEach((x) => x.classList.toggle("selected", x === el));
+  }));
+}
+
+function editDeviceDialog(dev) {
+  const known = blaster(dev.blaster_id);
+  openDialog(`<form method="dialog">
+    <div class="dlg-head">Edit device</div>
+    <div class="dlg-body">
+      <label>Name<input name="name" required maxlength="80" value="${esc(dev.name)}" autofocus></label>
+      <label>IR blaster<select name="blaster_id">${known ? "" : `<option value="${esc(dev.blaster_id)}" selected>⚠ Missing blaster</option>`}${blasterOptions(dev.blaster_id)}</select></label>
+      <span class="hint">Moving a device to another blaster keeps its learned codes (IR codes are the same for any blaster of the same model).</span>
+    </div>
+    <div class="dlg-foot">
+      <button class="btn danger left" value="delete" formnovalidate>Delete device</button>
+      <button class="btn" value="cancel" formnovalidate>Cancel</button>
+      <button class="btn primary" value="ok">Save</button>
+    </div></form>`, async (fd, action) => {
+    if (action === "delete") {
+      if (!confirm(`Delete “${dev.name}” and all its ${dev.controls.length} controls?`)) return false;
+      await api("DELETE", `devices/${dev.id}`);
+      state.devices = state.devices.filter((d) => d.id !== dev.id);
+      selectDevice(currentDevices()[0]?.id ?? null);
+      toast("Device deleted");
+      return;
+    }
+    Object.assign(dev, await api("PUT", `devices/${dev.id}`, { name: fd.get("name"), blaster_id: fd.get("blaster_id") }));
+    if (dev.blaster_id !== state.blasterId) selectBlaster(dev.blaster_id); else render();
+  });
+}
+
+function editControlDialog(dev, ctl) {
+  openDialog(`<form method="dialog">
+    <div class="dlg-head">Edit control</div>
+    <div class="dlg-body">
+      <label>Name<input name="name" required maxlength="80" value="${esc(ctl.name)}" autofocus></label>
+      <label>IR code<textarea name="code" class="mono" placeholder="Learn it, or paste a Zigbee2MQTT (base64) IR code">${esc(ctl.code || "")}</textarea></label>
+      <span class="hint">${ctl.code ? `${ctl.code.length} characters` : "No code yet"}</span>
+    </div>
+    <div class="dlg-foot">
+      <button class="btn danger left" value="delete" formnovalidate>Delete</button>
+      ${ctl.code ? `<button class="btn" type="button" id="copy-code">Copy</button>` : ""}
+      <button class="btn" value="cancel" formnovalidate>Cancel</button>
+      <button class="btn primary" value="ok">Save</button>
+    </div></form>`, async (fd, action) => {
+    if (action === "delete") {
+      if (!confirm(`Delete control “${ctl.name}”?`)) return false;
+      await api("DELETE", `devices/${dev.id}/controls/${ctl.id}`);
+      dev.controls = dev.controls.filter((c) => c.id !== ctl.id);
+      render();
+      return;
+    }
+    Object.assign(ctl, await api("PUT", `devices/${dev.id}/controls/${ctl.id}`, { name: fd.get("name"), code: fd.get("code") }));
+    render();
+  });
+  $("#copy-code", dlg)?.addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(ctl.code); toast("Code copied"); } catch { toast("Clipboard not available", true); }
+  });
+}
+
+// ------------------------------------------------------------------ learning
+let learnTimer = null;
+
+function learnView(dev, ctl, phase, extra = "") {
+  const b = blaster(dev.blaster_id);
+  const icon = { waiting: "📡", ok: "✅", fail: "⚠️" }[phase];
+  return `<div class="learn">
+    <div class="pulse ${phase === "waiting" ? "active" : phase}">${icon}</div>
+    ${extra}
+  </div>`.replace("%BLASTER%", esc(b?.name ?? "the blaster"));
+}
+
+async function startLearn(dev, ctl) {
+  const b = blaster(dev.blaster_id);
+  if (!b) { toast("This device's blaster was not found", true); return; }
+  let remaining = state.options.learn_timeout || 30;
+  openDialog(`<form method="dialog">${learnView(dev, ctl, "waiting", `
+      <h3>Press “${esc(ctl.name)}” on your remote</h3>
+      <p>Point the original remote at <b>%BLASTER%</b> from close range (5–20 cm) and press the button once.</p>
+      <p>Waiting… <span class="countdown" id="countdown">${remaining}s</span></p>`)}
+    <div class="dlg-foot"><button class="btn" value="abort">Cancel</button></div></form>`, async (_, action) => {
+    if (action === "abort") {
+      await api("POST", "learn/cancel", { blaster_id: b.id }).catch(() => {});
+      return false; // the pending learn request resolves with {cancelled}, which closes the dialog
+    }
+  });
+  dlg.onclose = () => { clearInterval(learnTimer); api("POST", "learn/cancel", { blaster_id: b.id }).catch(() => {}); };
+  learnTimer = setInterval(() => {
+    remaining = Math.max(0, remaining - 1);
+    const el = $("#countdown", dlg);
+    if (el) el.textContent = remaining + "s";
+  }, 1000);
+
+  let result, error;
+  try {
+    result = await api("POST", `devices/${dev.id}/controls/${ctl.id}/learn`);
+  } catch (e) {
+    error = e;
+  }
+  clearInterval(learnTimer);
+  dlg.onclose = null;
+  if (!dlg.open) return; // user closed with Esc
+
+  if (result?.cancelled) { dlg.close(); return; }
+  if (error) {
+    dlg.innerHTML = `<form method="dialog">${learnView(dev, ctl, "fail", `
+        <h3>Nothing learned</h3><p>${esc(error.message)}</p>`)}
+      <div class="dlg-foot"><button class="btn" value="close">Close</button>
+      <button class="btn primary" type="button" id="retry">Try again</button></div></form>`;
+    $("#retry", dlg).onclick = () => startLearn(dev, ctl);
+    return;
+  }
+
+  Object.assign(ctl, result);
+  render();
+  const next = dev.controls.find((c) => !c.code);
+  dlg.innerHTML = `<form method="dialog">${learnView(dev, ctl, "ok", `
+      <h3>Learned “${esc(ctl.name)}”</h3>
+      <p>The code was saved to this control. Press <b>Test</b> to make sure the device reacts.</p>
+      <div class="code-preview mono">${esc(ctl.code)}</div>`)}
+    <div class="dlg-foot">
+      <button class="btn left" type="button" id="test">▶ Test</button>
+      <button class="btn" type="button" id="again">Re-learn</button>
+      ${next ? `<button class="btn primary" type="button" id="next">Next: ${esc(next.name)}</button>` : `<button class="btn primary" value="close">Done</button>`}
+    </div></form>`;
+  $("#test", dlg).onclick = () => sendControl(dev, ctl);
+  $("#again", dlg).onclick = () => startLearn(dev, ctl);
+  if (next) $("#next", dlg).onclick = () => startLearn(dev, next);
+}
+
+async function sendControl(dev, ctl) {
+  await run(() => api("POST", `devices/${dev.id}/controls/${ctl.id}/send`));
+  toast(`Sent “${ctl.name}”`);
+}
+
+// ------------------------------------------------------------------ settings
+function settingsDialog() {
+  openDialog(`<form method="dialog">
+    <div class="dlg-head">Settings</div>
+    <div class="dlg-body">
+      <div class="hint">IR blasters are detected from Home Assistant automatically. Only change the MQTT topic if your Zigbee2MQTT friendly name differs from the Home Assistant device name.</div>
+      ${state.blasters.map((b) => `<div class="blaster-row" data-id="${esc(b.id)}">
+        <div><b>${esc(b.name)}</b> <span class="meta">${esc(b.model || "")}${b.learned_entity ? " · " + esc(b.learned_entity) : ""}</span></div>
+        <div class="row"><input name="topic" value="${esc(b.topic)}" placeholder="${esc(b.default_topic)}">
+          <button class="btn small" type="button" data-save>Save</button>
+          ${b.manual ? `<button class="btn small danger" type="button" data-remove>Remove</button>` : ""}</div>
+      </div>`).join("") || `<div class="hint">No blasters detected.</div>`}
+      <details><summary>Add a blaster manually</summary>
+        <div class="dlg-body" style="padding:10px 0 0">
+          <label>Name<input id="mb-name" placeholder="Bedroom IR"></label>
+          <label>Zigbee2MQTT topic<input id="mb-topic" placeholder="${esc(state.options.z2m_base_topic)}/Bedroom IR"></label>
+          <button class="btn" type="button" id="mb-add">Add blaster</button>
+        </div>
+      </details>
+      <div class="row" style="display:flex;gap:8px;flex-wrap:wrap">
+        <a class="btn" href="api/export" download="ir-remotes.json">Export all devices</a>
+        <label class="btn" style="flex-direction:row;color:var(--text)">Import…<input type="file" id="import-file" accept="application/json,.json" hidden></label>
+      </div>
+      <div class="hint">Learned controls ${state.options.expose_buttons ? "are" : "are not"} published to Home Assistant as button entities (change this in the app's Configuration tab).</div>
+    </div>
+    <div class="dlg-foot"><button class="btn primary" value="close">Close</button></div></form>`);
+
+  dlg.querySelectorAll(".blaster-row").forEach((row) => {
+    const id = row.dataset.id;
+    $("[data-save]", row).onclick = () => run(async () => {
+      await api("PUT", `blasters/${id}`, { topic: $("input", row).value });
+      await load(true);
+      toast("Topic saved");
+    });
+    const rm = $("[data-remove]", row);
+    if (rm) rm.onclick = () => run(async () => {
+      await api("DELETE", `blasters/${id}`);
+      row.remove();
+      await load(true);
+    });
+  });
+  $("#mb-add", dlg).onclick = () => run(async () => {
+    const { id } = await api("POST", "blasters", { name: $("#mb-name", dlg).value, topic: $("#mb-topic", dlg).value });
+    await load(true);
+    dlg.close();
+    selectBlaster(id);
+  });
+  $("#import-file", dlg).onchange = (e) => run(async () => {
+    const file = e.target.files[0];
+    if (!file) return;
+    let data;
+    try { data = JSON.parse(await file.text()); } catch { throw new Error("That file is not valid JSON"); }
+    const target = state.blasterId && confirm("Assign all imported devices to the currently selected blaster?\n(Cancel keeps the blaster stored in the file.)")
+      ? state.blasterId : undefined;
+    const { imported } = await api("POST", "import", { ...data, blaster_id: target });
+    await load();
+    dlg.close();
+    toast(`Imported ${imported} device(s)`);
+  });
+}
+
+// ------------------------------------------------------------------ events
+$("#blaster-select").addEventListener("change", (e) => selectBlaster(e.target.value));
+$("#refresh-btn").addEventListener("click", () => run(async () => { await load(true); toast("Blasters re-scanned"); }));
+$("#settings-btn").addEventListener("click", settingsDialog);
+$("#new-device-btn").addEventListener("click", newDeviceDialog);
+$("#device-list").addEventListener("click", (e) => {
+  const li = e.target.closest("li[data-id]");
+  if (li) selectDevice(li.dataset.id);
+});
+
+$("#main").addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-action]");
+  if (!btn) return;
+  const dev = currentDevice();
+  const ctl = dev?.controls.find((c) => c.id === btn.dataset.id);
+  switch (btn.dataset.action) {
+    case "new-device": return newDeviceDialog();
+    case "edit-device": return editDeviceDialog(dev);
+    case "learn": return startLearn(dev, ctl);
+    case "send": return sendControl(dev, ctl);
+    case "edit-control": return editControlDialog(dev, ctl);
+    case "suggest": return addControl(dev, btn.dataset.name, false);
+  }
+});
+
+$("#main").addEventListener("submit", (e) => {
+  if (e.target.id !== "add-control-form") return;
+  e.preventDefault();
+  const name = e.target.elements.name.value.trim();
+  if (!name) { e.target.elements.name.focus(); return; }
+  addControl(currentDevice(), name, e.submitter?.value === "learn");
+});
+
+async function addControl(dev, name, learn) {
+  const ctl = await run(() => api("POST", `devices/${dev.id}/controls`, { name }));
+  dev.controls.push(ctl);
+  render();
+  $("#add-control-form input")?.focus();
+  if (learn) startLearn(dev, ctl);
+}
+
+// Drag & drop reordering of control tiles
+let dragId = null;
+$("#main").addEventListener("dragstart", (e) => {
+  const tile = e.target.closest?.(".control");
+  if (!tile) return;
+  dragId = tile.dataset.id;
+  tile.classList.add("dragging");
+  e.dataTransfer.effectAllowed = "move";
+});
+$("#main").addEventListener("dragover", (e) => {
+  const tile = e.target.closest(".control");
+  if (!dragId || !tile) return;
+  e.preventDefault();
+  document.querySelectorAll(".drop-target").forEach((t) => t.classList.remove("drop-target"));
+  if (tile.dataset.id !== dragId) tile.classList.add("drop-target");
+});
+$("#main").addEventListener("dragend", () => {
+  dragId = null;
+  document.querySelectorAll(".dragging,.drop-target").forEach((t) => t.classList.remove("dragging", "drop-target"));
+});
+$("#main").addEventListener("drop", (e) => {
+  const tile = e.target.closest(".control");
+  const dev = currentDevice();
+  if (!dragId || !tile || !dev || tile.dataset.id === dragId) return;
+  e.preventDefault();
+  const ids = dev.controls.map((c) => c.id).filter((id) => id !== dragId);
+  ids.splice(ids.indexOf(tile.dataset.id), 0, dragId);
+  const pos = Object.fromEntries(ids.map((id, i) => [id, i]));
+  dev.controls.sort((a, b) => pos[a.id] - pos[b.id]);
+  render();
+  run(() => api("PUT", `devices/${dev.id}`, { order: ids }));
+});
+
+load().catch((e) => {
+  $("#banner").hidden = false;
+  $("#banner").textContent = "Could not load: " + e.message;
+});

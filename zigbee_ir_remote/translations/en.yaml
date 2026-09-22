@@ -1,0 +1,13 @@
+configuration:
+  z2m_base_topic:
+    name: Zigbee2MQTT base topic
+    description: MQTT base topic of Zigbee2MQTT (default "zigbee2mqtt").
+  learn_timeout:
+    name: Learn timeout (seconds)
+    description: How long to wait for a remote button press while learning.
+  expose_buttons:
+    name: Expose controls as Home Assistant buttons
+    description: Publish every learned control as an MQTT button entity so you can use it in dashboards and automations.
+  discovery_prefix:
+    name: MQTT discovery prefix
+    description: Home Assistant MQTT discovery prefix (default "homeassistant").
