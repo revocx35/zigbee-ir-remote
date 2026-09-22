@@ -672,16 +672,30 @@ def make_app(remote: IRRemote):
     return app
 
 
+def supervisor_token():
+    """The Supervisor token; s6-overlay keeps it out of our env, so also check its env dir."""
+    for name in ("SUPERVISOR_TOKEN", "HASSIO_TOKEN"):
+        if os.environ.get(name):
+            return os.environ[name]
+        path = Path("/run/s6/container_environment") / name
+        if path.exists() and path.read_text().strip():
+            return path.read_text().strip()
+    return None
+
+
 async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     options = load_options()
 
-    token = os.environ.get("SUPERVISOR_TOKEN")
+    token = supervisor_token()
     if token:
         ws_url = "ws://supervisor/core/websocket"
     else:  # standalone / development: HA_URL=http://homeassistant.local:8123 HA_TOKEN=<long-lived>
-        token = os.environ["HA_TOKEN"]
+        token = os.environ.get("HA_TOKEN")
+        if not token:
+            raise SystemExit("No Supervisor token found. Make sure 'homeassistant_api: true' is set, "
+                             "or set HA_URL and HA_TOKEN when running outside Home Assistant.")
         ws_url = os.environ.get("HA_URL", "http://homeassistant.local:8123").rstrip("/")
         ws_url = ws_url.replace("http", "ws", 1) + "/api/websocket"
 
