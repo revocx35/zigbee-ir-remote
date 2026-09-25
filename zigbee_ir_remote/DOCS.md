@@ -1,10 +1,11 @@
 # Zigbee IR Remote
 
 A sidebar panel for learning and managing IR codes on Zigbee2MQTT IR blasters
-(Tuya ZS06 / TS1201, Moes UFO-R11 and other "zosung" based blasters).
+(Tuya ZS06 / TS1201, Moes UFO-R11 and other "zosung" based blasters), plus smart climate
+control for your rooms. The panel has two tabs: **📡 Remotes** and **🌡️ Climate**.
 
 ## How to use
-1. Open **IR Remote** in the sidebar.
+1. Open **IR Remote** in the sidebar (Remotes tab).
 2. Pick your **IR blaster** at the top. Every Zigbee2MQTT device that has a
    `learned_ir_code` entity is detected automatically.
 3. Click **+ New** to create a device (TV, AC, …). A template can pre-fill controls.
@@ -12,6 +13,19 @@ A sidebar panel for learning and managing IR codes on Zigbee2MQTT IR blasters
    original remote at the blaster (5–20 cm) and press the button. The code is
    saved to that control. Use **▶ Test** to send it back.
 5. Add or rename controls, edit/paste codes by hand (✎), drag tiles to reorder.
+
+### If learning fails
+The dialog says what happened:
+- **"Nothing arrived from the blaster on …"**: the app heard nothing from the blaster's MQTT
+  topic. If the blaster didn't react when learning started, its topic is probably wrong: set
+  the Zigbee2MQTT friendly name in ⚙ Settings. Otherwise hold the remote closer (5–20 cm) and
+  try again.
+- **"The blaster only reported the code it had already learned"**: the code was identical to
+  the last one learned and your Zigbee2MQTT is too old to tell them apart. Press the button
+  again, or update Zigbee2MQTT.
+- The app's **Log** tab shows a `Learning: message from …` line for everything the blaster sends
+  while learning.
+- The blaster leaves learning mode by itself. If it seems stuck, unplug it for a few seconds.
 
 ## Full-config ACs (one selector instead of buttons)
 Many AC remotes don't send "temp up" or "fan up". Every press sends the **entire state**
@@ -95,8 +109,9 @@ data:
   also watched as a fallback.
 - If the Zigbee2MQTT friendly name differs from the Home Assistant device name,
   set the correct topic in ⚙ Settings. Blasters can also be added there by topic.
-- Data is stored in `/data/remotes.json` and included in app backups. You can
-  export/import all devices as JSON from Settings.
+- Data (devices, blasters, climate regions) is stored in `/data/remotes.json` and included
+  in app backups. **Export/Import** in Settings covers devices only; climate regions are not
+  part of the export.
 
 ## Options
 | Option | Default | Description |

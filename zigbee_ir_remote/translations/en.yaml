@@ -6,8 +6,8 @@ configuration:
     name: Learn timeout (seconds)
     description: How long to wait for a remote button press while learning.
   expose_buttons:
-    name: Expose controls as Home Assistant buttons
-    description: Publish every learned control as an MQTT button entity so you can use it in dashboards and automations.
+    name: Expose controls to Home Assistant
+    description: Publish every learned control as an MQTT button entity (or one select entity per full-config AC) so you can use it in dashboards and automations. Climate regions are always published.
   discovery_prefix:
     name: MQTT discovery prefix
     description: Home Assistant MQTT discovery prefix (default "homeassistant").
