@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.1
+- Fix learning getting stuck: after a timeout or cancel the app sent `learn_ir_code: OFF`, which
+  Zigbee2MQTT treats as *start* learning, so the blaster swallowed the next button press and later
+  attempts timed out.
+- Re-learning a button whose code is identical to the last learned one now works (uses the capture
+  timestamp that recent Zigbee2MQTT versions publish).
+- Failed learns say what happened (nothing received from the blaster vs. only the old code) and each
+  message from the blaster is logged.
+
 ## 1.2.0
 - New **Climate** tab: smart temperature/humidity control per room ("region").
   - A region is linked to a Home Assistant area and holds one or more ACs (HA `climate` entities

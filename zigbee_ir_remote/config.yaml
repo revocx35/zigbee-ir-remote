@@ -1,5 +1,5 @@
 name: Zigbee IR Remote
-version: "1.2.0"
+version: "1.2.1"
 slug: zigbee_ir_remote
 description: Learn and manage IR codes for Zigbee2MQTT IR blasters (Tuya ZS06 / UFO-R11 etc.), with smart room climate control
 url: https://github.com/revocx35/zigbee-ir-remote

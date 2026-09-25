@@ -40,6 +40,9 @@ INVALID_STATES = {None, "", "unknown", "unavailable", "None"}
 # Messages arriving this soon after we enable learning are the blaster's
 # acknowledgement (still carrying the previous code), never a fresh capture.
 ACK_WINDOW = 2.0
+# Recent Zigbee2MQTT stamps each capture (learned_ir_timings.timestamp); allow this much
+# clock difference between it and us when deciding whether a stamp is from this session.
+CLOCK_SKEW = 5.0
 # "buttons": every control is its own HA button.
 # "configs": every control is a full AC state; HA gets one select to choose between them.
 DEVICE_KINDS = ("buttons", "configs")
@@ -213,6 +216,10 @@ class LearnCancelled(Exception):
     pass
 
 
+class LearnTimeout(Exception):
+    """No new code arrived in time; the message says what the blaster did send."""
+
+
 class IRRemote:
     def __init__(self, ha, store, options):
         self.ha = ha
@@ -322,6 +329,8 @@ class IRRemote:
                     queue.put_nowait(("initial" if key == "a" else "state", st))
 
         stale = set()
+        heard = 0  # MQTT messages from the blaster during this session
+        repeated = False  # it reported a code, but only the one it already had
         success = False
         try:
             subs.append(await self.ha.call({"type": "mqtt/subscribe", "topic": blaster["topic"]}, on_mqtt))
@@ -338,7 +347,7 @@ class IRRemote:
                             stale.add(val)
 
             await self.ha.mqtt_publish(f"{blaster['topic']}/set", {"learn_ir_code": "ON"})
-            started = time.monotonic()
+            started, started_at = time.monotonic(), time.time()
             deadline = started + self.opts["learn_timeout"]
             seen_on = False
             LOG.info("Learning on %s for %s / %s", blaster["name"], device["name"], control["name"])
@@ -346,7 +355,7 @@ class IRRemote:
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise asyncio.TimeoutError
+                    raise LearnTimeout(self._learn_failure(blaster, heard, repeated))
                 get = asyncio.ensure_future(queue.get())
                 stop = asyncio.ensure_future(cancel.wait())
                 done, _ = await asyncio.wait({get, stop}, timeout=remaining,
@@ -357,15 +366,25 @@ class IRRemote:
                 if stop in done:
                     raise LearnCancelled
                 if get not in done:
-                    raise asyncio.TimeoutError
+                    raise LearnTimeout(self._learn_failure(blaster, heard, repeated))
                 kind, payload = get.result()
                 in_ack = time.monotonic() - started < ACK_WINDOW
 
                 if kind == "disconnect":
                     raise HAError("Lost connection to Home Assistant while learning")
                 if kind == "mqtt":
+                    heard += 1
                     code = payload.get("learned_ir_code")
                     mode = payload.get("learn_ir_code")
+                    timings = payload.get("learned_ir_timings")
+                    stamp = timings.get("timestamp") if isinstance(timings, dict) else None
+                    LOG.info("Learning: message from %s (code: %s, capture time: %s)", blaster["topic"],
+                             f"{len(code)} chars" if code else "none", "yes" if stamp else "no")
+                    # A capture stamped after learning started is new, even if its code is identical
+                    # to the previously learned one (e.g. re-learning the same button).
+                    if code and isinstance(stamp, (int, float)) and stamp / 1000 >= started_at - CLOCK_SKEW:
+                        success = True
+                        return code
                     if mode == "ON" and not seen_on:
                         seen_on = True
                         if code:
@@ -380,6 +399,7 @@ class IRRemote:
                     if code not in stale or (seen_on and mode == "OFF" and not in_ack):
                         success = True
                         return code
+                    repeated = True
                 elif kind == "state":
                     candidates = [payload.get("s"), (payload.get("a") or {}).get("learned_ir_code")]
                     for code in candidates:
@@ -387,14 +407,26 @@ class IRRemote:
                             success = True
                             return code
         finally:
+            # Nothing is sent to stop learning: Zigbee2MQTT treats any learn_ir_code value,
+            # "OFF" included, as "start learning", which would swallow the next button press.
+            # The blaster leaves learning mode by itself.
             self.learning.pop(bid, None)
             for sid in subs:
                 await self.ha.unsubscribe(sid)
             if not success:
-                try:
-                    await self.ha.mqtt_publish(f"{blaster['topic']}/set", {"learn_ir_code": "OFF"})
-                except Exception:  # noqa: BLE001
-                    pass
+                LOG.info("Learning on %s ended without a new code (%d messages received)", blaster["name"], heard)
+
+    @staticmethod
+    def _learn_failure(blaster, heard, repeated):
+        if repeated:
+            return ("The blaster only reported the code it had already learned, so nothing new was saved. "
+                    "Press the button again, or update Zigbee2MQTT: recent versions let the app recognise "
+                    "a button whose code is identical to the last one learned.")
+        if not heard:
+            return (f"Nothing arrived from the blaster on “{blaster['topic']}”. If its LED didn't light up "
+                    "when learning started, the topic is probably wrong: check it in Settings (⚙). Otherwise "
+                    "hold the remote 5–20 cm from the blaster and press the button again.")
+        return "No IR signal received. Point the remote at the blaster from close range and try again."
 
     # ---------- HA entities ----------
     async def sync_entities(self):
@@ -1366,9 +1398,8 @@ def make_app(remote: IRRemote):
         blaster = await remote.blaster(dev["blaster_id"])
         try:
             code = await remote.learn(blaster, dev, ctl)
-        except asyncio.TimeoutError:
-            return web.json_response({"error": "No IR signal received. Point the remote at the "
-                                      "blaster from close range and try again."}, status=408)
+        except LearnTimeout as err:
+            return web.json_response({"error": str(err)}, status=408)
         except LearnCancelled:
             return web.json_response({"cancelled": True})
         # Control may have been deleted/edited while waiting; re-resolve it.
