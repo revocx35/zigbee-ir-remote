@@ -8,11 +8,14 @@ running as an app) to:
   * optionally publish every control as an MQTT discovery button entity, or, for
     "config" devices (ACs whose remote sends the full state on every press),
     one select entity listing the device's learned configs
+  * run "climate regions": keep a room at a target temperature/humidity by stepping its
+    ACs (HA climate entities or IR devices) through increasingly aggressive settings
 """
 
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -180,7 +183,7 @@ class Store:
 
     def __init__(self, path):
         self.path = path
-        self.data = {"devices": [], "blasters": {}, "published": []}
+        self.data = {"devices": [], "blasters": {}, "published": [], "regions": []}
         if path.exists():
             try:
                 self.data.update(json.loads(path.read_text()))
@@ -217,6 +220,7 @@ class IRRemote:
         self.opts = options
         self._blaster_cache = (0.0, [])
         self.learning = {}  # blaster_id -> {"cancel": Event, "device": .., "control": ..}
+        self.climate = None  # set in main()
         self._sync_lock = asyncio.Lock()
 
     # ---------- blasters ----------
@@ -278,6 +282,14 @@ class IRRemote:
     # ---------- IR ----------
     async def send(self, blaster, code):
         await self.ha.mqtt_publish(f"{blaster['topic']}/set", {"ir_code_to_send": code})
+
+    async def send_control(self, dev, ctl):
+        """Send a control's code; for config devices also show it as the select's state."""
+        if not ctl.get("code"):
+            raise HAError(f"“{ctl['name']}” has no learned IR code")
+        await self.send(await self.blaster(dev["blaster_id"]), ctl["code"])
+        if dev.get("kind") == "configs":
+            await self.ha.mqtt_publish(f"irremote/device/{dev['id']}/state", ctl["name"])
 
     async def learn(self, blaster, device, control):
         bid = blaster["id"]
@@ -384,13 +396,13 @@ class IRRemote:
                 except Exception:  # noqa: BLE001
                     pass
 
-    # ---------- HA button entities ----------
-    async def sync_buttons(self):
-        """Publish (or remove) MQTT discovery configs so each control is an HA button."""
+    # ---------- HA entities ----------
+    async def sync_entities(self):
+        """Publish (or remove) MQTT discovery configs: buttons/selects for devices, climate regions."""
         async with self._sync_lock:
-            await self._sync_buttons()
+            await self._sync_entities()
 
-    async def _sync_buttons(self):
+    async def _sync_entities(self):
         prefix = self.opts["discovery_prefix"]
         wanted = {}
         if self.opts["expose_buttons"]:
@@ -426,6 +438,8 @@ class IRRemote:
                         "icon": ctl.get("icon") or "mdi:remote",
                         "device": device_info,
                     }
+        if self.climate:
+            wanted.update(self.climate.discovery(prefix))
         published = set(self.store.data.get("published", []))
         signature = self.store.data.get("published_sig", {})
         try:
@@ -438,11 +452,16 @@ class IRRemote:
                     await self.ha.mqtt_publish(topic, body, retain=True)
                     signature[topic] = body
         except HAError as err:
-            LOG.warning("Could not sync HA buttons: %s", err)
+            LOG.warning("Could not sync HA entities: %s", err)
             return
         self.store.data["published"] = sorted(wanted)
         self.store.data["published_sig"] = signature
         self.store.save()
+        if self.climate:
+            try:
+                await self.climate.assign_areas()
+            except HAError as err:
+                LOG.warning("Could not assign climate regions to areas: %s", err)
 
     @staticmethod
     def _select_config(dev, blaster, device_info):
@@ -467,10 +486,679 @@ class IRRemote:
             "command_topic": f"{blaster['topic']}/set",
             "command_template": template,
             "options": list(codes),
+            # Optimistic for choices made in HA; the state topic reports sends from this app.
             "optimistic": True,
+            "state_topic": f"irremote/device/{dev['id']}/state",
             "icon": dev.get("icon") or "mdi:air-conditioner",
             "device": device_info,
         }
+
+
+# ---------------------------------------------------------------- climate regions
+
+CLIMATE_TOPIC = "irremote/climate"
+TICK_SECONDS = 5
+RETRY_SECONDS = 60
+TEMP_DIRS = ("heat", "cool")
+HUMIDITY_DIRS = ("dry", "humidify")
+VERBS = {"heat": "Heating", "cool": "Cooling", "dry": "Dehumidifying", "humidify": "Humidifying"}
+HUMIDITY_RANGE = (20, 80)
+# field: (default, min, max). target_temp's range depends on HA's unit, see Climate.temp_range().
+REGION_NUMBERS = {
+    "target_temp": (24.0, None, None),
+    "temp_tolerance": (1.0, 0.1, 10),
+    "target_humidity": (50.0, *HUMIDITY_RANGE),
+    "humidity_tolerance": (5.0, 1, 30),
+    "importance": (50.0, 0, 100),  # % of each step given to temperature when both are off target
+    "step_minutes": (10.0, 1, 240),
+    "min_cycle_minutes": (3.0, 0, 60),
+}
+HA_COMMANDS = ("enabled", "target_temp", "target_humidity", "importance")
+
+
+def name_temperature(name):
+    """Setpoint written in an IR config's name, e.g. 26 for "Heat 26° · Fan Auto"."""
+    m = re.search(r"(\d+(?:[.,]\d+)?)\s*°", name) or re.search(r"\b(\d{2}(?:[.,]\d+)?)\b", name)
+    return float(m.group(1).replace(",", ".")) if m else None
+
+
+def clean_step(kind, step):
+    if not isinstance(step, dict):
+        return None
+    if kind == "ir":
+        return {"control": str(step["control"])} if step.get("control") else None
+    if not step.get("hvac_mode"):
+        return None
+    try:
+        temp = None if step.get("temperature") in (None, "") else float(step["temperature"])
+    except (TypeError, ValueError):
+        temp = None
+    if temp is not None and not math.isfinite(temp):
+        temp = None
+    return {
+        "hvac_mode": str(step["hvac_mode"]),
+        "temperature": temp,
+        "relative": bool(step.get("relative")) and temp is not None,
+        "fan_mode": str(step["fan_mode"]) if step.get("fan_mode") else None,
+    }
+
+
+def clean_ac(ac):
+    """An AC in a region: an IR device of this app or an HA climate entity, plus its ladders."""
+    if not isinstance(ac, dict) or ac.get("type") not in ("ir", "climate"):
+        return None
+    out = {"id": str(ac.get("id") or new_id())[:32], "type": ac["type"]}
+    if ac["type"] == "ir":
+        if not ac.get("device_id"):
+            return None
+        out["device_id"] = str(ac["device_id"])
+        out["off_control"] = str(ac["off_control"]) if ac.get("off_control") else None
+    else:
+        if not str(ac.get("entity_id") or "").startswith("climate."):
+            return None
+        out["entity_id"] = ac["entity_id"]
+    ladders = ac.get("ladders") if isinstance(ac.get("ladders"), dict) else {}
+    out["ladders"] = {}
+    for direction in TEMP_DIRS + HUMIDITY_DIRS:
+        steps = ladders.get(direction) if isinstance(ladders.get(direction), list) else []
+        out["ladders"][direction] = [s for s in (clean_step(ac["type"], x) for x in steps) if s]
+    return out
+
+
+class Climate:
+    """Keeps each region's room at its targets by stepping its ACs up their ladders.
+
+    Time runs in steps of `step_minutes`. While the room is outside the accepted difference,
+    every AC runs the current step of its heat/cool (or dry/humidify) ladder. When a step ends
+    and the room still isn't in range, the next, more aggressive step is used. If temperature
+    and humidity are both off target, each step is split between them by `importance`
+    (the percentage of the step given to temperature, which goes first).
+    """
+
+    def __init__(self, remote):
+        self.remote = remote
+        self.ha = remote.ha
+        self.store = remote.store
+        self.unit = "°C"
+        self.areas = {}  # area_id -> name
+        self.states = {}  # watched entity_id -> {"s": state, "a": attributes}
+        self.rt = {}  # region id -> runtime state
+        self._meta_loaded = False
+        self._watch = None  # (subscription id, watched entity ids)
+        self._commands = None  # subscription id for commands from HA entities
+        self._published = {}  # region id -> last state payload
+        self._area_synced = {}  # region id -> area id assigned in the device registry
+        self._entity_cache = (0.0, [])
+        self._wake = asyncio.Event()
+
+    @property
+    def regions(self):
+        return self.store.data["regions"]
+
+    def region(self, rid):
+        for r in self.regions:
+            if r["id"] == rid:
+                return r
+        raise web.HTTPNotFound(text="Region not found")
+
+    def temp_range(self):
+        return (50, 90) if self.unit == "°F" else (10, 32)
+
+    def poke(self):
+        """Re-evaluate now instead of at the next tick."""
+        self._wake.set()
+
+    # ---------- configuration ----------
+    def new_region(self):
+        region = {"id": new_id(), "name": "", "area_id": None, "enabled": False, "humidity_control": True,
+                  "temp_sensors": [], "humidity_sensors": [], "acs": []}
+        region.update({key: default for key, (default, _, _) in REGION_NUMBERS.items()})
+        if self.unit == "°F":
+            region.update(target_temp=75.0, temp_tolerance=2.0)
+        return region
+
+    def update(self, region, data):
+        """Apply a partial update from the UI or from Home Assistant; all fields are validated first."""
+        changes = {}
+        if "name" in data:
+            changes["name"] = str(data["name"] or "").strip()[:80]
+            if not changes["name"]:
+                raise web.HTTPBadRequest(text="Name is required")
+        if "area_id" in data:
+            changes["area_id"] = str(data["area_id"]) if data["area_id"] else None
+        for key in ("enabled", "humidity_control"):
+            if key in data:
+                changes[key] = bool(data[key])
+        for key, (_, lo, hi) in REGION_NUMBERS.items():
+            if key not in data:
+                continue
+            try:
+                value = float(data[key])
+            except (TypeError, ValueError):
+                value = math.nan
+            if not math.isfinite(value):
+                raise web.HTTPBadRequest(text=f"{key} must be a number")
+            if key == "target_temp":
+                lo, hi = self.temp_range()
+            changes[key] = round(min(max(value, lo), hi), 2)
+        for key in ("temp_sensors", "humidity_sensors"):
+            if key in data:
+                ids = data[key] if isinstance(data[key], list) else []
+                changes[key] = list(dict.fromkeys(e for e in ids if isinstance(e, str) and "." in e))
+        if "acs" in data:
+            acs = data["acs"] if isinstance(data["acs"], list) else []
+            changes["acs"] = [ac for ac in map(clean_ac, acs) if ac]
+        region.update(changes)
+        self.poke()
+
+    # ---------- Home Assistant data ----------
+    async def load_meta(self):
+        config, areas = await asyncio.gather(
+            self.ha.call({"type": "get_config"}),
+            self.ha.call({"type": "config/area_registry/list"}),
+        )
+        self.unit = (config.get("unit_system") or {}).get("temperature") or "°C"
+        self.areas = {a["area_id"]: a["name"] for a in areas}
+        self._meta_loaded = True
+
+    async def entities(self, force=False):
+        """Climate entities and temperature/humidity sensors, for the region editor."""
+        ts, cached = self._entity_cache
+        if not force and time.monotonic() - ts < 15:
+            return cached
+        await self.load_meta()
+        states, ents, devs = await asyncio.gather(
+            self.ha.call({"type": "get_states"}),
+            self.ha.call({"type": "config/entity_registry/list"}),
+            self.ha.call({"type": "config/device_registry/list"}),
+        )
+        dev_area = {d["id"]: d.get("area_id") for d in devs}
+        registry = {e["entity_id"]: e for e in ents}
+        result = []
+        for st in states:
+            eid = st["entity_id"]
+            reg = registry.get(eid, {})
+            if (reg.get("unique_id") or "").startswith("irremote_region_"):
+                continue  # our own averages must not feed back into a region
+            domain = eid.split(".", 1)[0]
+            attrs = st.get("attributes") or {}
+            dclass, unit = attrs.get("device_class"), attrs.get("unit_of_measurement")
+            if domain == "climate":
+                kind = "climate"
+            elif domain == "sensor" and (dclass == "temperature" or unit in ("°C", "°F")):
+                kind = "temperature"
+            elif domain == "sensor" and (dclass == "humidity" or (unit == "%" and "humid" in eid)):
+                kind = "humidity"
+            else:
+                continue
+            ent = {
+                "entity_id": eid, "kind": kind, "name": attrs.get("friendly_name") or eid,
+                "state": st.get("state"), "unit": unit,
+                "area_id": reg.get("area_id") or dev_area.get(reg.get("device_id")),
+            }
+            if kind == "climate":
+                ent.update({k: attrs.get(k) for k in ("hvac_modes", "fan_modes", "min_temp", "max_temp",
+                                                     "target_temp_step")})
+            result.append(ent)
+        result.sort(key=lambda e: e["name"].lower())
+        self._entity_cache = (time.monotonic(), result)
+        return result
+
+    async def _prepare(self):
+        """(Re)subscribe to HA commands and to the entities the regions read."""
+        if not self._meta_loaded:
+            await self.load_meta()
+        if self._commands is None:
+            self._commands = await self.ha.call(
+                {"type": "mqtt/subscribe", "topic": f"{CLIMATE_TOPIC}/+/+/set"}, self._on_command)
+        wanted = sorted({e for r in self.regions for e in r["temp_sensors"] + r["humidity_sensors"]}
+                        | {ac["entity_id"] for r in self.regions for ac in r["acs"] if ac["type"] == "climate"})
+        if self._watch and self._watch[1] != wanted:
+            sub, self._watch = self._watch[0], None
+            await self.ha.unsubscribe(sub)
+        if wanted and not self._watch:
+            sub = await self.ha.call({"type": "subscribe_entities", "entity_ids": wanted}, self._on_entities)
+            self._watch = (sub, wanted)
+            await asyncio.sleep(0.5)  # let the initial snapshot land before deciding anything
+            self.states = {k: v for k, v in self.states.items() if k in wanted}
+
+    def _on_entities(self, ev):
+        if ev is None:  # disconnected
+            self._watch = None
+            self.states.clear()
+            return
+        for eid, st in (ev.get("a") or {}).items():
+            self.states[eid] = {"s": st.get("s"), "a": dict(st.get("a") or {})}
+        for eid, diff in (ev.get("c") or {}).items():
+            cur = self.states.setdefault(eid, {"s": None, "a": {}})
+            plus = diff.get("+") or {}
+            if "s" in plus:
+                cur["s"] = plus["s"]
+            cur["a"].update(plus.get("a") or {})
+            for key in (diff.get("-") or {}).get("a") or []:
+                cur["a"].pop(key, None)
+        for eid in ev.get("r") or []:
+            self.states.pop(eid, None)
+
+    def _on_command(self, ev):
+        """A region's switch/number entity was changed in Home Assistant."""
+        if ev is None:  # disconnected; resubscribe and republish everything on reconnect
+            self._commands = None
+            self._meta_loaded = False
+            self._published.clear()
+            return
+        parts = (ev.get("topic") or "").split("/")
+        if len(parts) != 5 or parts[3] not in HA_COMMANDS:
+            return
+        region = next((r for r in self.regions if r["id"] == parts[2]), None)
+        if not region:
+            return
+        payload = str(ev.get("payload") or "").strip()
+        value = payload.upper() in ("ON", "TRUE", "1") if parts[3] == "enabled" else payload
+        try:
+            self.update(region, {parts[3]: value})
+        except web.HTTPException:
+            return
+        LOG.info("Climate %s: %s set to %s from Home Assistant", region["name"], parts[3], payload)
+        self.store.save()
+        self.publish_soon(region)
+
+    # ---------- control loop ----------
+    async def run(self):
+        while True:
+            await self.ha.connected.wait()
+            try:
+                await self._prepare()
+                for region in list(self.regions):
+                    if region not in self.regions:  # deleted while we were busy
+                        continue
+                    try:
+                        await self._tick(region, time.time())
+                        await self.publish_state(region)
+                    except HAError as err:
+                        LOG.warning("Climate %s: %s", region["name"], err)
+            except HAError as err:
+                LOG.warning("Climate control: %s", err)
+            except Exception:  # noqa: BLE001 - never let the loop die
+                LOG.exception("Climate control error")
+            self._wake.clear()
+            try:
+                await asyncio.wait_for(self._wake.wait(), TICK_SECONDS)
+            except asyncio.TimeoutError:
+                pass
+
+    def _average(self, entity_ids):
+        values = []
+        for eid in entity_ids:
+            try:
+                value = float((self.states.get(eid) or {}).get("s"))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                values.append(value)
+        return round(sum(values) / len(values), 2) if values else None
+
+    def _runtime(self, region):
+        if region["id"] not in self.rt:
+            self.rt[region["id"]] = {
+                "phase": "idle", "changed_at": 0.0, "active": None, "status": "Starting…",
+                "section_start": None, "switch_at": None, "hold_until": None,
+                "temperature": None, "humidity": None,
+                "temp_dir": None, "temp_level": 0, "temp_levels": 0, "temp_since": 0.0,
+                "hum_dir": None, "hum_level": 0, "hum_levels": 0, "hum_since": 0.0,
+                "sent": {}, "errors": {}, "steps": {},
+            }
+        return self.rt[region["id"]]
+
+    async def _tick(self, region, now):
+        rt = self._runtime(region)
+        rt["temperature"] = self._average(region["temp_sensors"])
+        rt["humidity"] = self._average(region["humidity_sensors"])
+
+        if not region["enabled"]:
+            if rt["phase"] != "disabled":
+                offs = {ac["id"]: self._off(ac) for ac in region["acs"]}
+                if not await self._apply(region, rt, offs, now, only_running=True):
+                    rt["status"] = "Turning off…"
+                    return  # retried on a later tick
+                if rt["phase"] == "active":
+                    rt["changed_at"] = now
+                rt.update(phase="disabled", active=None, section_start=None, switch_at=None, hold_until=None,
+                          temp_dir=None, temp_level=0, hum_dir=None, hum_level=0, steps={})
+            rt["status"] = "Off"
+            return
+        if rt["phase"] == "disabled":
+            rt["phase"] = "idle"
+
+        t_dir = self._temp_need(region, rt["temperature"])
+        h_dir = self._humidity_need(region, rt["humidity"]) if region["humidity_control"] else None
+
+        # Short-cycle protection: don't switch the ACs on/off again too soon after the last switch.
+        wants, running = bool(t_dir or h_dir), rt["phase"] == "active"
+        wait = region["min_cycle_minutes"] * 60 - (now - rt["changed_at"])
+        if wants != running and wait > 0:
+            rt["hold_until"] = now + wait
+            rt["status"] = "In range · keeping ACs on briefly" if running else "Starting soon (short-cycle protection)"
+            return
+        rt["hold_until"] = None
+
+        for key, direction in (("temp", t_dir), ("hum", h_dir)):
+            if rt[f"{key}_dir"] != direction:  # newly off target (or the other way): start gently
+                rt.update({f"{key}_dir": direction, f"{key}_level": 0, f"{key}_since": now})
+            rt[f"{key}_levels"] = self._levels(region, direction) if direction else 0
+            rt[f"{key}_level"] = min(rt[f"{key}_level"], max(rt[f"{key}_levels"] - 1, 0))
+        needs = [key for key in ("temp", "hum") if rt[f"{key}_dir"]]
+
+        section = region["step_minutes"] * 60
+        if not needs:
+            rt["section_start"] = None
+        elif rt["section_start"] is None:
+            rt["section_start"] = now
+        elif now - rt["section_start"] >= section:
+            for key in needs:  # a whole step went by and it's still off target: go one step harder
+                if rt[f"{key}_since"] <= rt["section_start"]:
+                    rt[f"{key}_level"] = min(rt[f"{key}_level"] + 1, rt[f"{key}_levels"] - 1)
+            rt["section_start"] = now
+
+        rt["switch_at"] = None
+        if len(needs) == 2:
+            temp_share = section * region["importance"] / 100
+            if now - rt["section_start"] < temp_share:
+                active = "temp"
+                rt["switch_at"] = rt["section_start"] + temp_share
+            else:
+                active = "hum"
+        else:
+            active = needs[0] if needs else None
+        if bool(active) != running:
+            rt["changed_at"] = now
+        rt["phase"] = "active" if active else "idle"
+        rt["active"] = active
+
+        commands, rt["steps"] = {}, {}
+        for ac in region["acs"]:
+            command = self._off(ac)
+            if active:
+                direction = rt[f"{active}_dir"]
+                ladder = self._ladder(region, ac, direction)
+                if ladder:
+                    step = ladder[min(rt[f"{active}_level"], len(ladder) - 1)]
+                    command = self._command(region, ac, step)
+                    rt["steps"][ac["id"]] = {"dir": direction, "index": ac["ladders"][direction].index(step)}
+            commands[ac["id"]] = command
+        await self._apply(region, rt, commands, now)
+        rt["status"] = self._status_text(region, rt)
+
+    def _temp_need(self, region, temp):
+        if temp is None:
+            return None
+        target, tol = region["target_temp"], region["temp_tolerance"]
+        direction = "heat" if temp < target - tol else "cool" if temp > target + tol else None
+        return direction if direction and self._levels(region, direction) else None
+
+    def _humidity_need(self, region, humidity):
+        if humidity is None:
+            return None
+        target, tol = region["target_humidity"], region["humidity_tolerance"]
+        direction = "dry" if humidity > target + tol else "humidify" if humidity < target - tol else None
+        return direction if direction and self._levels(region, direction) else None
+
+    def _status_text(self, region, rt):
+        if not region["temp_sensors"] and not region["humidity_sensors"]:
+            return "Add sensors to start"
+        if not region["acs"]:
+            return "Add an AC to start"
+        if rt["active"]:
+            key = rt["active"]
+            return f"{VERBS[rt[key + '_dir']]} · step {rt[key + '_level'] + 1} of {rt[key + '_levels']}"
+        if rt["temperature"] is None and rt["humidity"] is None:
+            return "No sensor data"
+        return "Idle · in range"
+
+    # ---------- ladders and commands ----------
+    def _ir(self, ac, control_id=None):
+        dev = next((d for d in self.store.data["devices"] if d["id"] == ac.get("device_id")), None)
+        ctl = next((c for c in dev["controls"] if c["id"] == control_id), None) if dev and control_id else None
+        return dev, ctl
+
+    def _levels(self, region, direction):
+        return max((len(self._ladder(region, ac, direction)) for ac in region["acs"]), default=0)
+
+    def _ladder(self, region, ac, direction):
+        """An AC's usable steps; heat/cool steps set on the wrong side of the target are skipped."""
+        steps = ac["ladders"].get(direction, [])
+        if ac["type"] == "ir":
+            steps = [s for s in steps if (self._ir(ac, s["control"])[1] or {}).get("code")]
+        if direction in TEMP_DIRS and len(steps) > 1:
+            target = region["target_temp"]
+
+            def reaches(step):
+                if ac["type"] == "ir":
+                    temp = name_temperature(self._ir(ac, step["control"])[1]["name"])
+                else:
+                    temp = self._command(region, ac, step)["temperature"]
+                return temp is None or (temp >= target if direction == "heat" else temp <= target)
+            steps = [s for s in steps if reaches(s)] or steps[-1:]
+        return steps
+
+    def _command(self, region, ac, step):
+        """A ladder step resolved to what gets sent (compared by value to avoid resending)."""
+        if ac["type"] == "ir":
+            return {"control": step["control"]}
+        temp = step.get("temperature")
+        if temp is not None:
+            attrs = (self.states.get(ac["entity_id"]) or {}).get("a") or {}
+            if step.get("relative"):
+                temp += region["target_temp"]
+            if isinstance(attrs.get("min_temp"), (int, float)):
+                temp = max(temp, attrs["min_temp"])
+            if isinstance(attrs.get("max_temp"), (int, float)):
+                temp = min(temp, attrs["max_temp"])
+            inc = attrs.get("target_temp_step") or (1 if self.unit == "°F" else 0.5)
+            temp = round(round(temp / inc) * inc, 1)
+        return {"hvac_mode": step["hvac_mode"], "temperature": temp, "fan_mode": step.get("fan_mode")}
+
+    @staticmethod
+    def _off(ac):
+        if ac["type"] == "ir":
+            return {"control": ac["off_control"]} if ac.get("off_control") else None
+        return {"hvac_mode": "off", "temperature": None, "fan_mode": None}
+
+    def _label(self, ac, command):
+        if ac["type"] == "ir":
+            ctl = self._ir(ac, command["control"])[1]
+            return ctl["name"] if ctl else "deleted config"
+        if command["hvac_mode"] == "off":
+            return "Off"
+        text = command["hvac_mode"].replace("_", " ").capitalize()
+        if command.get("temperature") is not None:
+            text += f" {command['temperature']:g}{self.unit}"
+        if command.get("fan_mode"):
+            text += f" · fan {command['fan_mode']}"
+        return text
+
+    async def _apply(self, region, rt, commands, now, only_running=False):
+        """Send each AC its command if it changed. Returns False if any send failed."""
+        ok = True
+        for ac in region["acs"]:
+            command = commands.get(ac["id"])
+            if command is None:
+                continue
+            sig = json.dumps(command, sort_keys=True)
+            last = rt["sent"].get(ac["id"])
+            if last and last["sig"] == sig:
+                continue
+            if only_running and (not last or last["off"]):
+                continue
+            error = rt["errors"].get(ac["id"])
+            if error and error["sig"] == sig and now < error["retry"]:
+                ok = False
+                continue
+            try:
+                await self._send(ac, command)
+            except (HAError, web.HTTPException) as err:
+                message = getattr(err, "text", None) or str(err)
+                rt["errors"][ac["id"]] = {"sig": sig, "retry": now + RETRY_SECONDS, "message": message}
+                LOG.warning("Climate %s: could not send to AC: %s", region["name"], message)
+                ok = False
+                continue
+            rt["errors"].pop(ac["id"], None)
+            label = self._label(ac, command)
+            rt["sent"][ac["id"]] = {"sig": sig, "off": command == self._off(ac), "label": label}
+            LOG.info("Climate %s: %s -> %s", region["name"], self._ac_name(ac), label)
+        return ok
+
+    def _ac_name(self, ac):
+        if ac["type"] == "ir":
+            dev = self._ir(ac)[0]
+            return dev["name"] if dev else "deleted IR device"
+        return ac["entity_id"]
+
+    async def _send(self, ac, command):
+        if ac["type"] == "ir":
+            dev, ctl = self._ir(ac, command["control"])
+            if not dev or not ctl:
+                raise HAError("The IR device or config was deleted")
+            await self.remote.send_control(dev, ctl)
+            return
+        target = {"entity_id": ac["entity_id"]}
+        mode = command["hvac_mode"]
+        if mode != "off" and command.get("temperature") is not None:
+            data = {"hvac_mode": mode, "temperature": command["temperature"]}
+            await self._service("set_temperature", target, data)
+        else:
+            await self._service("set_hvac_mode", target, {"hvac_mode": mode})
+        if mode != "off" and command.get("fan_mode"):
+            await self._service("set_fan_mode", target, {"fan_mode": command["fan_mode"]})
+
+    async def _service(self, service, target, data):
+        await self.ha.call({"type": "call_service", "domain": "climate", "service": service,
+                            "service_data": data, "target": target})
+
+    # ---------- reporting ----------
+    def status(self):
+        out = {}
+        for region in self.regions:
+            rt = self._runtime(region)
+            acs = {}
+            for ac in region["acs"]:
+                info = {"label": (rt["sent"].get(ac["id"]) or {}).get("label"),
+                        "error": (rt["errors"].get(ac["id"]) or {}).get("message"),
+                        "step": rt["steps"].get(ac["id"])}
+                if ac["type"] == "climate" and ac["entity_id"] in self.states:
+                    st = self.states[ac["entity_id"]]
+                    temp = st["a"].get("temperature")
+                    info["current"] = f"{st['s']}" + (f" {temp:g}{self.unit}" if isinstance(temp, (int, float)) else "")
+                acs[ac["id"]] = info
+            out[region["id"]] = {
+                "phase": rt["phase"], "status": rt["status"], "active": rt["active"],
+                "temperature": rt["temperature"], "humidity": rt["humidity"],
+                "temp": {"dir": rt["temp_dir"], "level": rt["temp_level"], "levels": rt["temp_levels"]},
+                "hum": {"dir": rt["hum_dir"], "level": rt["hum_level"], "levels": rt["hum_levels"]},
+                "section_end": rt["section_start"] + region["step_minutes"] * 60 if rt["section_start"] else None,
+                "switch_at": rt["switch_at"], "hold_until": rt["hold_until"],
+                "readings": {e: (self.states.get(e) or {}).get("s")
+                             for e in region["temp_sensors"] + region["humidity_sensors"]},
+                "acs": acs,
+            }
+        return out
+
+    async def publish_state(self, region):
+        rt = self._runtime(region)
+        rounded = {k: (round(rt[k], 1) if rt[k] is not None else None) for k in ("temperature", "humidity")}
+        body = json.dumps({
+            "enabled": region["enabled"], "target_temp": region["target_temp"],
+            "target_humidity": region["target_humidity"], "importance": region["importance"],
+            "status": rt["status"], **rounded,
+        }, sort_keys=True)
+        if self._published.get(region["id"]) != body:
+            await self.ha.mqtt_publish(f"{CLIMATE_TOPIC}/{region['id']}/state", body, retain=True)
+            self._published[region["id"]] = body
+
+    def publish_soon(self, region):
+        async def publish():
+            try:
+                await self.publish_state(region)
+            except HAError as err:
+                LOG.warning("Could not publish climate state: %s", err)
+        asyncio.ensure_future(publish())
+
+    async def remove(self, region):
+        """A region was deleted: switch off what it had running and drop its retained state."""
+        rt = self.rt.pop(region["id"], None)
+        self._published.pop(region["id"], None)
+        try:
+            if rt:
+                await self._apply(region, rt, {ac["id"]: self._off(ac) for ac in region["acs"]},
+                                  time.time(), only_running=True)
+            await self.ha.mqtt_publish(f"{CLIMATE_TOPIC}/{region['id']}/state", "", retain=True)
+        except HAError as err:
+            LOG.warning("Could not clean up climate region: %s", err)
+
+    def discovery(self, prefix):
+        """MQTT discovery configs: a switch, target sliders and readings for every region."""
+        wanted = {}
+        tmin, tmax = self.temp_range()
+        for region in self.regions:
+            rid, slug = region["id"], slugify(region["name"])
+            base = f"{CLIMATE_TOPIC}/{rid}"
+            device = {"identifiers": [f"irremote_region_{rid}"], "name": region["name"],
+                      "manufacturer": "Zigbee IR Remote", "model": "Climate region"}
+            if self.areas.get(region.get("area_id")):
+                device["suggested_area"] = self.areas[region["area_id"]]
+            entities = {
+                ("switch", "enabled"): {
+                    "name": "Climate control", "icon": "mdi:thermostat-auto",
+                    "command_topic": f"{base}/enabled/set",
+                    "value_template": "{{ 'ON' if value_json.enabled else 'OFF' }}"},
+                ("number", "target_temp"): {
+                    "name": "Target temperature", "command_topic": f"{base}/target_temp/set",
+                    "value_template": "{{ value_json.target_temp }}", "min": tmin, "max": tmax, "step": 0.5,
+                    "mode": "slider", "unit_of_measurement": self.unit, "device_class": "temperature"},
+                ("number", "target_humidity"): {
+                    "name": "Target humidity", "command_topic": f"{base}/target_humidity/set",
+                    "value_template": "{{ value_json.target_humidity }}", "min": HUMIDITY_RANGE[0],
+                    "max": HUMIDITY_RANGE[1], "step": 1, "mode": "slider", "unit_of_measurement": "%",
+                    "device_class": "humidity"},
+                ("number", "importance"): {
+                    "name": "Temperature priority", "icon": "mdi:scale-balance",
+                    "command_topic": f"{base}/importance/set", "value_template": "{{ value_json.importance }}",
+                    "min": 0, "max": 100, "step": 5, "mode": "slider", "unit_of_measurement": "%"},
+                ("sensor", "temperature"): {
+                    "name": "Temperature", "value_template": "{{ value_json.temperature }}",
+                    "unit_of_measurement": self.unit, "device_class": "temperature", "state_class": "measurement"},
+                ("sensor", "humidity"): {
+                    "name": "Humidity", "value_template": "{{ value_json.humidity }}",
+                    "unit_of_measurement": "%", "device_class": "humidity", "state_class": "measurement"},
+                ("sensor", "status"): {
+                    "name": "Status", "icon": "mdi:information-outline",
+                    "value_template": "{{ value_json.status }}"},
+            }
+            for (component, key), cfg in entities.items():
+                wanted[f"{prefix}/{component}/irremote_region_{rid}/{key}/config"] = {
+                    **cfg,
+                    "unique_id": f"irremote_region_{rid}_{key}",
+                    "default_entity_id": f"{component}.{slug}_{slugify(cfg['name'])}",
+                    "state_topic": f"{base}/state",
+                    "device": device,
+                }
+        return wanted
+
+    async def assign_areas(self):
+        """Move region devices into their area (suggested_area only applies on creation)."""
+        todo = {f"irremote_region_{r['id']}": r for r in self.regions
+                if r.get("area_id") and self._area_synced.get(r["id"]) != r["area_id"]}
+        if not todo:
+            return
+        for dev in await self.ha.call({"type": "config/device_registry/list"}):
+            for domain, ident in dev.get("identifiers") or []:
+                region = todo.get(ident) if domain == "mqtt" else None
+                if not region:
+                    continue
+                if dev.get("area_id") != region["area_id"]:
+                    await self.ha.call({"type": "config/device_registry/update", "device_id": dev["id"],
+                                        "area_id": region["area_id"]})
+                self._area_synced[region["id"]] = region["area_id"]
 
 
 # ---------------------------------------------------------------- HTTP API
@@ -486,6 +1174,7 @@ def ha_errors(handler):
 
 def make_app(remote: IRRemote):
     store = remote.store
+    climate = remote.climate
     routes = web.RouteTableDef()
 
     async def body(request):
@@ -499,7 +1188,7 @@ def make_app(remote: IRRemote):
 
     def changed():
         store.save()
-        asyncio.ensure_future(remote.sync_buttons())
+        asyncio.ensure_future(remote.sync_entities())
 
     def clean_name(value, what="Name"):
         value = (value or "").strip()
@@ -632,6 +1321,8 @@ def make_app(remote: IRRemote):
     async def delete_device(request):
         dev = store.device(request.match_info["did"])
         store.data["devices"].remove(dev)
+        for region in store.data["regions"]:
+            region["acs"] = [ac for ac in region["acs"] if ac.get("device_id") != dev["id"]]
         changed()
         return web.json_response({"ok": True})
 
@@ -702,7 +1393,54 @@ def make_app(remote: IRRemote):
         dev, ctl = store.control(request.match_info["did"], request.match_info["cid"])
         if not ctl.get("code"):
             raise web.HTTPBadRequest(text="This control has no IR code yet")
-        await remote.send(await remote.blaster(dev["blaster_id"]), ctl["code"])
+        await remote.send_control(dev, ctl)
+        return web.json_response({"ok": True})
+
+    # --- climate regions
+    @routes.get("/api/climate")
+    @ha_errors
+    async def climate_state(request):
+        entities = await climate.entities(force=request.query.get("refresh") == "1")
+        return web.json_response({
+            "unit": climate.unit,
+            "temp_range": climate.temp_range(),
+            "humidity_range": HUMIDITY_RANGE,
+            "areas": [{"id": k, "name": v} for k, v in sorted(climate.areas.items(), key=lambda a: a[1].lower())],
+            "entities": entities,
+            "regions": climate.regions,
+            "status": climate.status(),
+            "now": time.time(),
+        })
+
+    @routes.get("/api/climate/status")
+    async def climate_status(_):
+        return web.json_response({"regions": climate.regions, "status": climate.status(), "now": time.time()})
+
+    @routes.post("/api/regions")
+    async def add_region(request):
+        data = await body(request)
+        region = climate.new_region()
+        climate.update(region, {"name": data.get("name"), "area_id": data.get("area_id")})
+        store.data["regions"].append(region)
+        changed()
+        return web.json_response(region)
+
+    @routes.put("/api/regions/{rid}")
+    async def edit_region(request):
+        data = await body(request)
+        region = climate.region(request.match_info["rid"])
+        data.pop("id", None)
+        climate.update(region, data)
+        changed()
+        climate.publish_soon(region)
+        return web.json_response(region)
+
+    @routes.delete("/api/regions/{rid}")
+    async def delete_region(request):
+        region = climate.region(request.match_info["rid"])
+        store.data["regions"].remove(region)
+        changed()
+        asyncio.ensure_future(climate.remove(region))
         return web.json_response({"ok": True})
 
     # --- backup
@@ -777,12 +1515,18 @@ async def main():
 
     ha = HAClient(ws_url, token)
     remote = IRRemote(ha, Store(DATA_DIR / "remotes.json"), options)
+    remote.climate = Climate(remote)
     ha_task = asyncio.create_task(ha.run())
 
     async def initial_sync():
         await ha.connected.wait()
-        await remote.sync_buttons()
+        try:
+            await remote.climate.load_meta()  # areas are needed for the region devices
+        except HAError as err:
+            LOG.warning("Could not load Home Assistant areas: %s", err)
+        await remote.sync_entities()
     asyncio.create_task(initial_sync())
+    climate_task = asyncio.create_task(remote.climate.run())
 
     runner = web.AppRunner(make_app(remote))
     await runner.setup()
@@ -791,6 +1535,7 @@ async def main():
     try:
         await ha_task
     finally:
+        climate_task.cancel()
         await runner.cleanup()
 
 

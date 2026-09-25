@@ -37,6 +37,44 @@ Many AC remotes don't send "temp up" or "fan up". Every press sends the **entire
   when this app is stopped. The selector shows the last option chosen from Home
   Assistant; it can't know when the physical remote was used.
 
+## Smart climate control (Climate tab)
+The **🌡️ Climate** tab keeps rooms at a target temperature and humidity.
+
+1. **+ New** creates a *region*: pick the Home Assistant area (room) it belongs to.
+2. Add **temperature** and **humidity sensors**. The room value is the average of all of them.
+   Sensors in the region's area are listed first.
+3. **+ Add AC**: a Home Assistant AC (`climate.*` entity) or an IR device from the Remotes tab
+   (full-config ACs work best). Its steps are filled in automatically and can be edited:
+   - **IR devices**: pick configs, e.g. Heat ladder `Heat 26° → Heat 28° → Heat 30°`, plus the
+     config used to turn it off.
+   - **Home Assistant ACs**: mode + temperature (+ optional fan). A temperature can be exact or
+     *target ± value*, so `heat, target +3` means 28° when the target is 25°.
+4. Set the targets with the sliders and switch on **Automatic control**.
+
+### How it decides
+- If the room is colder than *target − accepted difference* it heats; warmer than
+  *target + accepted difference* it cools; the same for humidity (dehumidify / humidify).
+- Every AC starts at **step 1** of its ladder. After each **step length** (default 10 min) that
+  the room is still outside the accepted difference, it moves to the next, stronger step
+  (e.g. room 20°, target 25°: Heat 26° → 10 min later Heat 28° → 10 min later Heat 30°).
+- Once back in range, the ACs are turned off and the next time starts again at step 1.
+- Heat/cool steps set on the wrong side of the target are skipped: with a 27° target, a
+  `Heat 26°` step is skipped.
+- **Priority** (💧 humidity ← → 🌡️ temperature): when both are off target, each step is split
+  between them. At 50/50 with 10-minute steps the ACs work on temperature for 5 minutes, then on
+  humidity for 5 minutes. At 100% temperature, humidity waits until the temperature is in range.
+- **Min. time between on/off** stops the ACs from being switched on and off rapidly around the
+  edge of the accepted range.
+- If every sensor becomes unavailable the ACs are turned off. Turning a region off (or deleting it)
+  turns off the ACs it had running.
+
+### In Home Assistant
+Each region becomes a device (in its area) with:
+`switch.<region>_climate_control`, `number.<region>_target_temperature`,
+`number.<region>_target_humidity`, `number.<region>_temperature_priority`,
+and sensors for the average temperature, humidity and current status. Changing the sliders in
+Home Assistant or in the app updates both.
+
 ## Using the codes in Home Assistant
 With `expose_buttons` enabled (the default), every learned control becomes an MQTT
 `button` entity grouped under a device with the same name, so you can put it on

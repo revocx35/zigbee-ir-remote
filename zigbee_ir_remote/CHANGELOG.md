@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.2.0
+- New **Climate** tab: smart temperature/humidity control per room ("region").
+  - A region is linked to a Home Assistant area and holds one or more ACs (HA `climate` entities
+    or IR devices from this app, including full-config ACs) plus temperature/humidity sensors
+    (the room value is their average).
+  - Each AC has step ladders for heat, cool, dehumidify and humidify. When the room is outside
+    the accepted difference the ACs start at step 1, and every *step length* (10 min by default)
+    that the room is still off target they move to the next, stronger step. Back in range, they
+    are switched off.
+  - Humidity ↔ temperature priority slider splits each step between the two when both are off target.
+  - Adjustable: accepted differences, step length, minimum time between on/off (short-cycle protection).
+  - Home Assistant gets a device per region: on/off switch, target temperature, target humidity
+    and priority sliders, and average temperature, humidity and status sensors.
+- Full-config AC selectors now show the config last sent by this app.
+
 ## 1.1.0
 - New device type **AC (full config)** for AC remotes that send the whole state (mode, temperature,
   fan, swing) on every press. You learn complete configs like "Cool 22° · Fan Auto" and Home Assistant
