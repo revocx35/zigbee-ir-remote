@@ -4,12 +4,18 @@
 const TEMPLATES = [
   { key: "blank", emoji: "➕", name: "Blank", controls: [] },
   { key: "tv", emoji: "📺", name: "TV", controls: ["Power", "Volume Up", "Volume Down", "Mute", "Channel Up", "Channel Down", "Input", "Up", "Down", "Left", "Right", "OK", "Back", "Home", "Menu"] },
-  { key: "ac", emoji: "❄️", name: "Air conditioner", controls: ["Power On", "Power Off", "Temp Up", "Temp Down", "Mode", "Fan Speed", "Swing"] },
+  { key: "ac", emoji: "❄️", name: "AC (buttons)", controls: ["Power On", "Power Off", "Temp Up", "Temp Down", "Mode", "Fan Speed", "Swing"] },
+  { key: "ac_configs", emoji: "🎛️", name: "AC (full config)", kind: "configs", controls: ["Off"] },
   { key: "fan", emoji: "🌀", name: "Fan", controls: ["Power", "Speed Up", "Speed Down", "Oscillate", "Timer"] },
   { key: "audio", emoji: "🔊", name: "Soundbar / Amp", controls: ["Power", "Volume Up", "Volume Down", "Mute", "Input"] },
   { key: "projector", emoji: "📽️", name: "Projector", controls: ["Power On", "Power Off", "Input", "Menu", "OK", "Back"] },
   { key: "light", emoji: "💡", name: "LED light", controls: ["On", "Off", "Brighter", "Dimmer", "Red", "Green", "Blue", "White"] },
 ];
+// Config builder for "configs" devices (ACs whose remote sends the whole state on every press)
+const AC_MODES = ["Cool", "Heat", "Dry", "Fan only", "Auto"];
+const AC_FANS = ["Auto", "Low", "Medium", "High", "Turbo", "Quiet"];
+const AC_TEMPS = Array.from({ length: 17 }, (_, i) => 16 + i);
+const CONFIG_PRESETS = ["Off", "Cool 22°", "Cool 24°", "Heat 24°", "Dry", "Fan only"];
 const SUGGESTIONS = ["Power", "Power On", "Power Off", "Volume Up", "Volume Down", "Mute", "Channel Up", "Channel Down", "Input", "OK", "Back", "Home", "Menu", "Up", "Down", "Left", "Right", "Play", "Pause", "Stop"];
 
 const state = {
@@ -81,6 +87,7 @@ async function run(fn) {
 // ------------------------------------------------------------------ helpers
 const blaster = (id) => state.blasters.find((b) => b.id === id);
 const currentDevices = () => state.devices.filter((d) => d.blaster_id === state.blasterId);
+const isConfigs = (dev) => dev?.kind === "configs";
 const currentDevice = () => state.devices.find((d) => d.id === state.deviceId && d.blaster_id === state.blasterId);
 
 function selectBlaster(id) {
@@ -147,6 +154,9 @@ function renderMain() {
   const learned = dev.controls.filter((c) => c.code).length;
   const pct = dev.controls.length ? Math.round((learned / dev.controls.length) * 100) : 0;
   const nextUnlearned = dev.controls.find((c) => !c.code);
+  const cfg = isConfigs(dev);
+  const noun = cfg ? "configs" : "controls";
+  const suggestions = cfg ? CONFIG_PRESETS : SUGGESTIONS;
   main.innerHTML = `
     <div class="device-head">
       <div>
@@ -158,17 +168,20 @@ function renderMain() {
         <button class="btn" data-action="edit-device">Edit device</button>
       </div>
     </div>
-    ${dev.controls.length ? `<div class="progress-line"><div class="progress"><div style="width:${pct}%"></div></div>${learned} of ${dev.controls.length} controls learned</div>` : ""}
+    ${cfg ? `<div class="info-box">Full-config device: each config is a complete AC state (mode, temperature, fan…).
+      ${state.options.expose_buttons ? `Home Assistant gets <b>one selector</b> listing the ${learned} learned config${learned === 1 ? "" : "s"}; choosing one sends its code.` : "Publishing to Home Assistant is turned off in the app's Configuration tab."}</div>` : ""}
+    ${dev.controls.length ? `<div class="progress-line"><div class="progress"><div style="width:${pct}%"></div></div>${learned} of ${dev.controls.length} ${noun} learned</div>` : ""}
     <div class="controls-grid" id="controls-grid">
       ${dev.controls.map((c) => controlTile(c, !!b)).join("")}
     </div>
-    ${dev.controls.length ? "" : `<p class="hint">No controls yet. Add the buttons you want to learn below.</p>`}
+    ${dev.controls.length ? "" : `<p class="hint">${cfg ? "No configs yet. Build some below, e.g. Cool 22° · Fan Auto." : "No controls yet. Add the buttons you want to learn below."}</p>`}
     <form class="add-control" id="add-control-form">
-      <input name="name" placeholder="New control name, e.g. Power" autocomplete="off" maxlength="80">
+      <input name="name" placeholder="${cfg ? "New config name, e.g. Cool 22° · Fan Auto" : "New control name, e.g. Power"}" autocomplete="off" maxlength="80">
       <button class="btn" type="submit" name="mode" value="add">Add</button>
       <button class="btn primary" type="submit" name="mode" value="learn" ${b ? "" : "disabled"}>Add &amp; learn</button>
+      ${cfg ? `<button class="btn" type="button" data-action="build-configs">🎛️ Config builder…</button>` : ""}
     </form>
-    <div class="chips">${SUGGESTIONS.filter((s) => !dev.controls.some((c) => c.name.toLowerCase() === s.toLowerCase()))
+    <div class="chips">${suggestions.filter((s) => !dev.controls.some((c) => c.name.toLowerCase() === s.toLowerCase()))
       .map((s) => `<button class="chip" data-action="suggest" data-name="${esc(s)}">+ ${esc(s)}</button>`).join("")}</div>`;
 }
 
@@ -230,6 +243,8 @@ function newDeviceDialog() {
       <div><div class="hint" style="margin-bottom:6px">Start from a template (you can add/remove controls later)</div>
         <div class="template-grid">${TEMPLATES.map((t) =>
           `<button type="button" class="template ${t.key === tpl ? "selected" : ""}" data-tpl="${t.key}"><span class="emoji">${t.emoji}</span>${esc(t.name)}</button>`).join("")}</div>
+        <div class="hint" id="tpl-hint" style="margin-top:8px" hidden>For ACs whose remote sends the whole state (mode, temperature, fan…) with every press.
+          You learn complete configs like “Cool 22° · Fan Auto”, and Home Assistant gets a single selector to switch between them.</div>
       </div>
     </div>
     <div class="dlg-foot">
@@ -237,7 +252,7 @@ function newDeviceDialog() {
       <button class="btn primary" value="ok">Create</button>
     </div></form>`, async (fd) => {
     const t = TEMPLATES.find((x) => x.key === tpl);
-    const dev = await api("POST", "devices", { name: fd.get("name"), blaster_id: fd.get("blaster_id"), controls: t.controls });
+    const dev = await api("POST", "devices", { name: fd.get("name"), blaster_id: fd.get("blaster_id"), kind: t.kind || "buttons", controls: t.controls });
     state.devices.push(dev);
     state.blasterId = dev.blaster_id;
     localSet("blaster", dev.blaster_id);
@@ -248,6 +263,7 @@ function newDeviceDialog() {
   dlg.querySelectorAll(".template").forEach((el) => el.addEventListener("click", () => {
     tpl = el.dataset.tpl;
     dlg.querySelectorAll(".template").forEach((x) => x.classList.toggle("selected", x === el));
+    $("#tpl-hint", dlg).hidden = TEMPLATES.find((x) => x.key === tpl).kind !== "configs";
   }));
 }
 
@@ -259,6 +275,11 @@ function editDeviceDialog(dev) {
       <label>Name<input name="name" required maxlength="80" value="${esc(dev.name)}" autofocus></label>
       <label>IR blaster<select name="blaster_id">${known ? "" : `<option value="${esc(dev.blaster_id)}" selected>⚠ Missing blaster</option>`}${blasterOptions(dev.blaster_id)}</select></label>
       <span class="hint">Moving a device to another blaster keeps its learned codes (IR codes are the same for any blaster of the same model).</span>
+      <label>Type<select name="kind">
+        <option value="buttons" ${isConfigs(dev) ? "" : "selected"}>Buttons: one Home Assistant button per control</option>
+        <option value="configs" ${isConfigs(dev) ? "selected" : ""}>Full config (AC): one Home Assistant selector of configs</option>
+      </select></label>
+      <span class="hint">Use “Full config” for AC remotes that send mode, temperature and fan together on every press. Learned codes are kept when switching.</span>
     </div>
     <div class="dlg-foot">
       <button class="btn danger left" value="delete" formnovalidate>Delete device</button>
@@ -273,14 +294,14 @@ function editDeviceDialog(dev) {
       toast("Device deleted");
       return;
     }
-    Object.assign(dev, await api("PUT", `devices/${dev.id}`, { name: fd.get("name"), blaster_id: fd.get("blaster_id") }));
+    Object.assign(dev, await api("PUT", `devices/${dev.id}`, { name: fd.get("name"), blaster_id: fd.get("blaster_id"), kind: fd.get("kind") }));
     if (dev.blaster_id !== state.blasterId) selectBlaster(dev.blaster_id); else render();
   });
 }
 
 function editControlDialog(dev, ctl) {
   openDialog(`<form method="dialog">
-    <div class="dlg-head">Edit control</div>
+    <div class="dlg-head">Edit ${isConfigs(dev) ? "config" : "control"}</div>
     <div class="dlg-body">
       <label>Name<input name="name" required maxlength="80" value="${esc(ctl.name)}" autofocus></label>
       <label>IR code<textarea name="code" class="mono" placeholder="Learn it, or paste a Zigbee2MQTT (base64) IR code">${esc(ctl.code || "")}</textarea></label>
@@ -293,7 +314,7 @@ function editControlDialog(dev, ctl) {
       <button class="btn primary" value="ok">Save</button>
     </div></form>`, async (fd, action) => {
     if (action === "delete") {
-      if (!confirm(`Delete control “${ctl.name}”?`)) return false;
+      if (!confirm(`Delete ${isConfigs(dev) ? "config" : "control"} “${ctl.name}”?`)) return false;
       await api("DELETE", `devices/${dev.id}/controls/${ctl.id}`);
       dev.controls = dev.controls.filter((c) => c.id !== ctl.id);
       render();
@@ -323,9 +344,14 @@ async function startLearn(dev, ctl) {
   const b = blaster(dev.blaster_id);
   if (!b) { toast("This device's blaster was not found", true); return; }
   let remaining = state.options.learn_timeout || 30;
+  const how = isConfigs(dev)
+    ? `<h3>Send “${esc(ctl.name)}” from your remote</h3>
+      <p>Point the remote at <b>%BLASTER%</b> (5–20 cm) and change it to this config; the <b>last</b> press is what gets learned.
+      Example: for Cool 22°, set it to Cool 21° first, then press Temp ▲ once.</p>`
+    : `<h3>Press “${esc(ctl.name)}” on your remote</h3>
+      <p>Point the original remote at <b>%BLASTER%</b> from close range (5–20 cm) and press the button once.</p>`;
   openDialog(`<form method="dialog">${learnView(dev, ctl, "waiting", `
-      <h3>Press “${esc(ctl.name)}” on your remote</h3>
-      <p>Point the original remote at <b>%BLASTER%</b> from close range (5–20 cm) and press the button once.</p>
+      ${how}
       <p>Waiting… <span class="countdown" id="countdown">${remaining}s</span></p>`)}
     <div class="dlg-foot"><button class="btn" value="abort">Cancel</button></div></form>`, async (_, action) => {
     if (action === "abort") {
@@ -365,7 +391,7 @@ async function startLearn(dev, ctl) {
   const next = dev.controls.find((c) => !c.code);
   dlg.innerHTML = `<form method="dialog">${learnView(dev, ctl, "ok", `
       <h3>Learned “${esc(ctl.name)}”</h3>
-      <p>The code was saved to this control. Press <b>Test</b> to make sure the device reacts.</p>
+      <p>The code was saved to this ${isConfigs(dev) ? "config" : "control"}. Press <b>Test</b> to make sure the device reacts.</p>
       <div class="code-preview mono">${esc(ctl.code)}</div>`)}
     <div class="dlg-foot">
       <button class="btn left" type="button" id="test">▶ Test</button>
@@ -380,6 +406,78 @@ async function startLearn(dev, ctl) {
 async function sendControl(dev, ctl) {
   await run(() => api("POST", `devices/${dev.id}/controls/${ctl.id}/send`));
   toast(`Sent “${ctl.name}”`);
+}
+
+// ------------------------------------------------------------------ config builder
+function configName(mode, temp, fan, swing) {
+  const parts = [mode + (temp ? ` ${temp}°` : "")];
+  if (fan) parts.push(`Fan ${fan}`);
+  if (swing) parts.push(`Swing ${swing}`);
+  return parts.join(" · ");
+}
+
+function configBuilderDialog(dev) {
+  const opts = (values, blank) => (blank ? `<option value="">${blank}</option>` : "")
+    + values.map((v) => `<option value="${esc(v)}">${esc(v)}</option>`).join("");
+  openDialog(`<form method="dialog">
+    <div class="dlg-head">Config builder</div>
+    <div class="dlg-body">
+      <div class="hint">Pick the settings; a config is created for each temperature in the range. Leave a field on “—” to keep it out of the name.</div>
+      <div class="field-grid">
+        <label>Mode<select name="mode">${opts(AC_MODES)}</select></label>
+        <label>Fan<select name="fan">${opts(AC_FANS, "—")}</select></label>
+        <label>Temperature from<select name="from">${opts(AC_TEMPS, "—")}</select></label>
+        <label>to<select name="to">${opts(AC_TEMPS, "only one")}</select></label>
+        <label>Swing<select name="swing">${opts(["On", "Off"], "—")}</select></label>
+      </div>
+      <div><div class="hint" id="cb-summary"></div><div class="chips" id="cb-preview"></div></div>
+    </div>
+    <div class="dlg-foot">
+      ${dev.controls.some((c) => c.name === "Off") ? "" : `<button class="btn left" type="button" id="cb-off">+ Off</button>`}
+      <button class="btn" value="cancel" formnovalidate>Cancel</button>
+      <button class="btn" value="add">Add</button>
+      <button class="btn primary" value="learn" ${blaster(dev.blaster_id) ? "" : "disabled"}>Add &amp; learn</button>
+    </div></form>`, async (fd, action) => {
+    const names = preview();
+    if (!names.length) { toast("Nothing new to add", true); return false; }
+    const added = [];
+    try {
+      for (const name of names) {
+        const ctl = await api("POST", `devices/${dev.id}/controls`, { name });
+        dev.controls.push(ctl);
+        added.push(ctl);
+      }
+    } finally {
+      render();
+    }
+    toast(`Added ${added.length} config${added.length === 1 ? "" : "s"}`);
+    if (action === "learn") { startLearn(dev, added[0]); return false; }
+  });
+  const form = $("form", dlg);
+  form.elements.from.value = "22";
+  function preview() {
+    const f = form.elements;
+    let temps = [f.from.value];
+    if (f.from.value && f.to.value) {
+      const [a, b] = [Number(f.from.value), Number(f.to.value)].sort((x, y) => x - y);
+      temps = AC_TEMPS.filter((t) => t >= a && t <= b).map(String);
+    }
+    const all = temps.map((t) => configName(f.mode.value, t, f.fan.value, f.swing.value));
+    const fresh = all.filter((n) => !dev.controls.some((c) => c.name === n));
+    $("#cb-summary", dlg).textContent = fresh.length
+      ? `Will add ${fresh.length} config${fresh.length === 1 ? "" : "s"}${all.length > fresh.length ? ` (${all.length - fresh.length} already exist)` : ""}:`
+      : "These configs already exist.";
+    $("#cb-preview", dlg).innerHTML = fresh.map((n) => `<span class="chip static">${esc(n)}</span>`).join("");
+    return fresh;
+  }
+  form.addEventListener("change", preview);
+  preview();
+  $("#cb-off", dlg)?.addEventListener("click", () => run(async () => {
+    dev.controls.push(await api("POST", `devices/${dev.id}/controls`, { name: "Off" }));
+    $("#cb-off", dlg).remove();
+    render();
+    toast("Added “Off”");
+  }));
 }
 
 // ------------------------------------------------------------------ settings
@@ -405,7 +503,7 @@ function settingsDialog() {
         <a class="btn" href="api/export" download="ir-remotes.json">Export all devices</a>
         <label class="btn" style="flex-direction:row;color:var(--text)">Import…<input type="file" id="import-file" accept="application/json,.json" hidden></label>
       </div>
-      <div class="hint">Learned controls ${state.options.expose_buttons ? "are" : "are not"} published to Home Assistant as button entities (change this in the app's Configuration tab).</div>
+      <div class="hint">Learned controls ${state.options.expose_buttons ? "are" : "are not"} published to Home Assistant: as button entities, or as one selector per full-config AC (change this in the app's Configuration tab).</div>
     </div>
     <div class="dlg-foot"><button class="btn primary" value="close">Close</button></div></form>`);
 
@@ -465,6 +563,7 @@ $("#main").addEventListener("click", (e) => {
     case "send": return sendControl(dev, ctl);
     case "edit-control": return editControlDialog(dev, ctl);
     case "suggest": return addControl(dev, btn.dataset.name, false);
+    case "build-configs": return configBuilderDialog(dev);
   }
 });
 

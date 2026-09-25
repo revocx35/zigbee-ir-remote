@@ -13,6 +13,30 @@ A sidebar panel for learning and managing IR codes on Zigbee2MQTT IR blasters
    saved to that control. Use **▶ Test** to send it back.
 5. Add or rename controls, edit/paste codes by hand (✎), drag tiles to reorder.
 
+## Full-config ACs (one selector instead of buttons)
+Many AC remotes don't send "temp up" or "fan up". Every press sends the **entire state**
+(power, mode, temperature, fan, swing). For those, create the device with the
+**AC (full config)** template, or switch an existing device's *Type* in **Edit device**.
+
+- Each entry is a **config**, a complete AC state such as `Cool 22° · Fan Auto`, plus `Off`.
+- **🎛️ Config builder…** creates many at once: pick mode, fan, swing and a temperature
+  range, e.g. Cool 18–26° creates 9 configs.
+- To learn a config, point the remote at the blaster and change it to that state. The
+  **last** press is what gets learned: for Cool 22°, set the remote to 21° first, then press
+  Temp ▲ once.
+- In Home Assistant the device gets **one `select` entity** (named after the device) whose
+  options are the learned configs. Choosing an option sends that config's code:
+  ```yaml
+  action: select.select_option
+  target:
+    entity_id: select.bedroom_ac
+  data:
+    option: "Cool 22° · Fan Auto"
+  ```
+  The code table is stored in the entity's command template, so it keeps working even
+  when this app is stopped. The selector shows the last option chosen from Home
+  Assistant; it can't know when the physical remote was used.
+
 ## Using the codes in Home Assistant
 With `expose_buttons` enabled (the default), every learned control becomes an MQTT
 `button` entity grouped under a device with the same name, so you can put it on
@@ -41,5 +65,5 @@ data:
 |---|---|---|
 | `z2m_base_topic` | `zigbee2mqtt` | Zigbee2MQTT base topic |
 | `learn_timeout` | `30` | Seconds to wait for a button press |
-| `expose_buttons` | `true` | Publish learned controls as HA button entities |
+| `expose_buttons` | `true` | Publish learned controls as HA button entities (or one select per full-config AC) |
 | `discovery_prefix` | `homeassistant` | MQTT discovery prefix |

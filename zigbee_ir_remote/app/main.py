@@ -5,15 +5,19 @@ running as an app) to:
   * discover Zigbee2MQTT IR blasters (devices exposing `learned_ir_code`)
   * put a blaster into learning mode and capture the learned code
   * send codes (`ir_code_to_send`) through the `mqtt.publish` service
-  * optionally publish every control as an MQTT discovery button entity
+  * optionally publish every control as an MQTT discovery button entity, or, for
+    "config" devices (ACs whose remote sends the full state on every press),
+    one select entity listing the device's learned configs
 """
 
 import asyncio
 import json
 import logging
 import os
+import re
 import secrets
 import time
+import unicodedata
 from pathlib import Path
 
 from aiohttp import ClientSession, WSMsgType, web
@@ -33,6 +37,9 @@ INVALID_STATES = {None, "", "unknown", "unavailable", "None"}
 # Messages arriving this soon after we enable learning are the blaster's
 # acknowledgement (still carrying the previous code), never a fresh capture.
 ACK_WINDOW = 2.0
+# "buttons": every control is its own HA button.
+# "configs": every control is a full AC state; HA gets one select to choose between them.
+DEVICE_KINDS = ("buttons", "configs")
 
 
 def load_options():
@@ -50,6 +57,11 @@ def load_options():
 
 def new_id():
     return secrets.token_hex(4)
+
+
+def slugify(text):
+    text = unicodedata.normalize("NFKD", str(text).replace("ı", "i")).encode("ascii", "ignore").decode()
+    return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_") or "ir"
 
 
 class HAError(Exception):
@@ -390,6 +402,17 @@ class IRRemote:
                 blaster = blasters.get(dev["blaster_id"])
                 if not blaster:
                     continue
+                device_info = {
+                    "identifiers": [f"irremote_{dev['id']}"],
+                    "name": dev["name"],
+                    "manufacturer": "Zigbee IR Remote",
+                    "model": f"IR device via {blaster['name']}",
+                }
+                if dev.get("kind") == "configs":
+                    select = self._select_config(dev, blaster, device_info)
+                    if select:
+                        wanted[f"{prefix}/select/irremote_{dev['id']}/config/config"] = select
+                    continue
                 for ctl in dev["controls"]:
                     if not ctl.get("code"):
                         continue
@@ -397,16 +420,11 @@ class IRRemote:
                     wanted[topic] = {
                         "name": ctl["name"],
                         "unique_id": f"irremote_{dev['id']}_{ctl['id']}",
-                        "object_id": f"{dev['name']}_{ctl['name']}",
+                        "default_entity_id": f"button.{slugify(dev['name'])}_{slugify(ctl['name'])}",
                         "command_topic": f"{blaster['topic']}/set",
                         "payload_press": json.dumps({"ir_code_to_send": ctl["code"]}),
                         "icon": ctl.get("icon") or "mdi:remote",
-                        "device": {
-                            "identifiers": [f"irremote_{dev['id']}"],
-                            "name": dev["name"],
-                            "manufacturer": "Zigbee IR Remote",
-                            "model": f"IR device via {blaster['name']}",
-                        },
+                        "device": device_info,
                     }
         published = set(self.store.data.get("published", []))
         signature = self.store.data.get("published_sig", {})
@@ -425,6 +443,34 @@ class IRRemote:
         self.store.data["published"] = sorted(wanted)
         self.store.data["published_sig"] = signature
         self.store.save()
+
+    @staticmethod
+    def _select_config(dev, blaster, device_info):
+        """One select entity whose options are the learned configs.
+
+        The option -> IR code table lives in the command template, so HA sends the code
+        straight to the blaster and it keeps working even when this app is stopped.
+        """
+        codes = {}
+        for ctl in dev["controls"]:
+            if ctl.get("code") and ctl["name"] not in codes:
+                codes[ctl["name"]] = ctl["code"]
+        if not codes:
+            return None
+        # A JSON object is also a valid Jinja dict literal (\uXXXX escapes included).
+        template = ("{% set codes = " + json.dumps(codes) + " %}"
+                    "{{ {'ir_code_to_send': codes[value]} | to_json }}")
+        return {
+            "name": None,  # entity takes the device name, e.g. "Bedroom AC"
+            "unique_id": f"irremote_{dev['id']}_config",
+            "default_entity_id": f"select.{slugify(dev['name'])}",
+            "command_topic": f"{blaster['topic']}/set",
+            "command_template": template,
+            "options": list(codes),
+            "optimistic": True,
+            "icon": dev.get("icon") or "mdi:air-conditioner",
+            "device": device_info,
+        }
 
 
 # ---------------------------------------------------------------- HTTP API
@@ -460,6 +506,18 @@ def make_app(remote: IRRemote):
         if not value:
             raise web.HTTPBadRequest(text=f"{what} is required")
         return value[:80]
+
+    def clean_kind(value):
+        if value not in DEVICE_KINDS:
+            raise web.HTTPBadRequest(text=f"Device type must be one of {', '.join(DEVICE_KINDS)}")
+        return value
+
+    def check_unique(dev, name, ctl_id=None):
+        """Config names are the HA select's options, so they must be unique per device."""
+        if dev.get("kind") != "configs":
+            return
+        if any(c["name"] == name and c["id"] != ctl_id for c in dev["controls"]):
+            raise web.HTTPConflict(text=f"There is already a config named “{name}”")
 
     @routes.get("/")
     async def index(_):
@@ -528,13 +586,18 @@ def make_app(remote: IRRemote):
     @routes.post("/api/devices")
     async def add_device(request):
         data = await body(request)
+        kind = clean_kind(data.get("kind") or "buttons")
+        names = []
+        for n in data.get("controls", []):
+            if isinstance(n, str) and n.strip() and n.strip()[:80] not in names:
+                names.append(n.strip()[:80])
         dev = {
             "id": new_id(),
             "name": clean_name(data.get("name")),
             "blaster_id": clean_name(data.get("blaster_id"), "Blaster"),
-            "icon": data.get("icon") or "mdi:remote",
-            "controls": [{"id": new_id(), "name": n[:80], "code": None}
-                         for n in data.get("controls", []) if isinstance(n, str) and n.strip()],
+            "kind": kind,
+            "icon": data.get("icon") or ("mdi:air-conditioner" if kind == "configs" else "mdi:remote"),
+            "controls": [{"id": new_id(), "name": n, "code": None} for n in names],
         }
         store.data["devices"].append(dev)
         changed()
@@ -550,6 +613,15 @@ def make_app(remote: IRRemote):
             dev["blaster_id"] = data["blaster_id"]
         if "icon" in data:
             dev["icon"] = data["icon"] or "mdi:remote"
+        if data.get("kind") and data["kind"] != dev.get("kind", "buttons"):
+            kind = clean_kind(data["kind"])
+            names = [c["name"] for c in dev["controls"]]
+            dupes = sorted({n for n in names if names.count(n) > 1})
+            if kind == "configs" and dupes:
+                raise web.HTTPConflict(text="Config names must be unique; rename first: " + ", ".join(dupes))
+            dev["kind"] = kind
+            if dev.get("icon") in ("mdi:remote", "mdi:air-conditioner"):
+                dev["icon"] = "mdi:air-conditioner" if kind == "configs" else "mdi:remote"
         if isinstance(data.get("order"), list):
             pos = {cid: i for i, cid in enumerate(data["order"])}
             dev["controls"].sort(key=lambda c: pos.get(c["id"], len(pos)))
@@ -569,6 +641,7 @@ def make_app(remote: IRRemote):
         data = await body(request)
         dev = store.device(request.match_info["did"])
         ctl = {"id": new_id(), "name": clean_name(data.get("name")), "code": (data.get("code") or None)}
+        check_unique(dev, ctl["name"])
         dev["controls"].append(ctl)
         changed()
         return web.json_response(ctl)
@@ -576,9 +649,11 @@ def make_app(remote: IRRemote):
     @routes.put("/api/devices/{did}/controls/{cid}")
     async def edit_control(request):
         data = await body(request)
-        _, ctl = store.control(request.match_info["did"], request.match_info["cid"])
+        dev, ctl = store.control(request.match_info["did"], request.match_info["cid"])
         if "name" in data:
-            ctl["name"] = clean_name(data["name"])
+            name = clean_name(data["name"])
+            check_unique(dev, name, ctl["id"])
+            ctl["name"] = name
         if "code" in data:
             ctl["code"] = (data["code"] or "").strip() or None
         if "icon" in data:
@@ -654,6 +729,7 @@ def make_app(remote: IRRemote):
                 "id": dev["id"] if dev.get("id") and dev["id"] not in existing else new_id(),
                 "name": str(dev["name"])[:80],
                 "blaster_id": data.get("blaster_id") or dev.get("blaster_id") or "",
+                "kind": dev.get("kind") if dev.get("kind") in DEVICE_KINDS else "buttons",
                 "icon": dev.get("icon") or "mdi:remote",
                 "controls": [
                     {"id": new_id(), "name": str(c.get("name"))[:80], "code": c.get("code") or None}

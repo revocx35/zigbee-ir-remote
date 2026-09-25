@@ -186,6 +186,14 @@ select:focus, input:focus, textarea:focus { outline: 2px solid var(--primary); o
   cursor: pointer;
 }
 .chip:hover { color: var(--text); border-color: var(--primary); }
+.chip.static { cursor: default; color: var(--text); border-style: solid; }
+.info-box {
+  background: color-mix(in srgb, var(--primary) 10%, var(--surface));
+  border: 1px solid color-mix(in srgb, var(--primary) 35%, var(--border));
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-bottom: 14px;
+}
 
 .empty-state { text-align: center; color: var(--muted); padding: 60px 20px; max-width: 520px; margin: 0 auto; }
 .empty-state h2 { color: var(--text); font-size: 18px; margin-bottom: 8px; }
@@ -208,6 +216,7 @@ dialog::backdrop { background: rgba(0, 0, 0, .45); }
 .dlg-foot { padding: 12px 20px 18px; display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
 .dlg-foot .left { margin-right: auto; }
 .hint { color: var(--muted); font-size: 12px; }
+.field-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .template-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 8px; }
 .template {
   font: inherit;
