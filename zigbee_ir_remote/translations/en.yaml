@@ -11,3 +11,8 @@ configuration:
   discovery_prefix:
     name: MQTT discovery prefix
     description: Home Assistant MQTT discovery prefix (default "homeassistant").
+  agent_api_hosts:
+    name: Agent API host names
+    description: Extra host names or addresses AI agents use to reach the agent API, comma separated (the host's own addresses and Home Assistant's URLs are added automatically). They go into the API's certificate.
+network:
+  8098/tcp: Agent API (MCP over HTTPS) for AI agents such as Jarvis. It answers only with a token made in the app's Settings.

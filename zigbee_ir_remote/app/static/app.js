@@ -502,6 +502,37 @@ function configBuilderDialog(dev) {
   }));
 }
 
+// ------------------------------------------------------------------ agent API
+async function renderAgentBox(token) {
+  const box = $("#agent-box", dlg);
+  if (!box) return;
+  let a;
+  try { a = await api("GET", "agent"); } catch (e) { box.textContent = e.message; return; }
+  box.innerHTML = `
+    <div class="hint">An AI agent can read and change your climate regions and press learned buttons through this app's agent API (MCP over HTTPS on port ${esc(a.port)}). It needs a token, and it should trust the app's own certificate (compare the fingerprint).</div>
+    ${token ? `<label>Token (shown only now, copy it)<input id="agent-token" readonly value="${esc(token)}"></label>` : ""}
+    <div class="hint">${a.enabled ? "On: a token was made " + esc(new Date(a.created * 1000).toLocaleString()) + "." : "Off: no token yet."}${a.running ? "" : " The API is not running (see the app's log)."}</div>
+    ${a.urls && a.urls.length ? `<div class="hint">MCP address (one of): ${a.urls.map((u) => `<code>${esc(u)}</code>`).join(" ")}</div>` : ""}
+    ${a.ca_fingerprint ? `<div class="hint">Certificate (CA) SHA-256: <code style="word-break:break-all">${esc(a.ca_fingerprint)}</code></div>
+      <details><summary>CA certificate (PEM)</summary><pre style="white-space:pre-wrap;font-size:11px">${esc(a.ca_pem)}</pre></details>` : ""}
+    <div class="row" style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn" type="button" id="agent-new">${a.enabled ? "Make a new token" : "Make a token"}</button>
+      ${a.enabled ? `<button class="btn danger" type="button" id="agent-off">Turn off</button>` : ""}
+    </div>`;
+  $("#agent-token", box)?.select();
+  $("#agent-new", box).onclick = () => run(async () => {
+    if (a.enabled && !confirm("Make a new token? The old one stops working.")) return;
+    const r = await api("POST", "agent/token");
+    await renderAgentBox(r.token);
+  });
+  const off = $("#agent-off", box);
+  if (off) off.onclick = () => run(async () => {
+    if (!confirm("Turn the agent API off? Agents using it lose access.")) return;
+    await api("DELETE", "agent/token");
+    await renderAgentBox();
+  });
+}
+
 // ------------------------------------------------------------------ settings
 function settingsDialog() {
   openDialog(`<form method="dialog">
@@ -526,6 +557,7 @@ function settingsDialog() {
         <label class="btn" style="flex-direction:row;color:var(--text)">Import…<input type="file" id="import-file" accept="application/json,.json" hidden></label>
       </div>
       <div class="hint">Learned controls ${state.options.expose_buttons ? "are" : "are not"} published to Home Assistant: as button entities, or as one selector per full-config AC (change this in the app's Configuration tab).</div>
+      <details id="agent-api"><summary>AI agents (Jarvis, Claude Code…)</summary><div id="agent-box" class="dlg-body" style="padding:10px 0 0">Loading…</div></details>
     </div>
     <div class="dlg-foot"><button class="btn primary" value="close">Close</button></div></form>`);
 
@@ -543,6 +575,7 @@ function settingsDialog() {
       await load(true);
     });
   });
+  renderAgentBox();
   $("#mb-add", dlg).onclick = () => run(async () => {
     const { id } = await api("POST", "blasters", { name: $("#mb-name", dlg).value, topic: $("#mb-topic", dlg).value });
     await load(true);

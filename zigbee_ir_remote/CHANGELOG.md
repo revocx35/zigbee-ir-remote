@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.0
+- **Agent API for AI agents** (e.g. telerouter's Jarvis on Claude Code): an MCP server on port 8098 (HTTPS)
+  with the tools `climate_status`, `set_climate`, `list_remotes` and `send_ir`. Turn it on under
+  ⚙ Settings → AI agents (*Make a token*). The token is shown once and stored only as a hash. TLS comes from the
+  app's own certificate authority, which the agent pins (fingerprint in Settings, `GET /ca.pem`).
+- New option *Agent API host names* for extra names in the API's certificate.
+
 ## 1.2.1
 - Fix learning getting stuck: after a timeout or cancel the app sent `learn_ir_code: OFF`, which
   Zigbee2MQTT treats as *start* learning, so the blaster swallowed the next button press and later

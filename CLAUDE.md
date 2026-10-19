@@ -19,7 +19,8 @@ There is no build step, no npm, and no framework.
 - Users install from the **`main` branch** through the HA app store, so pushing to `main` is a
   release. The owner is fine with committing straight to `main`.
 - On every user-visible change:
-  1. bump `version:` in `zigbee_ir_remote/config.yaml` (HA only offers an update when it changes);
+  1. bump `version:` in `zigbee_ir_remote/config.yaml` (HA only offers an update when it changes) and
+     `APP_VERSION` in `app/main.py` (the agent API reports it);
   2. add an entry at the top of `zigbee_ir_remote/CHANGELOG.md`;
   3. update `zigbee_ir_remote/DOCS.md`, which is the user documentation shown in HA;
   4. if you add or rename options, update **both** `config.yaml` (`options`/`schema`) and
@@ -70,6 +71,12 @@ worked:
   `DATA_DIR=./data HA_URL=http://homeassistant.local:8123 HA_TOKEN=<long-lived token> python zigbee_ir_remote/app/main.py`
   and open http://localhost:8099.
 
+- **Agent API**: the fake-HA setup above also drives it. Set `AGENT_PORT`, create
+  `main.AgentAPI(remote, main.AgentTLS(tmp / "tls"))`, `await agent.start()`, and call `https://127.0.0.1:<port>/mcp`
+  with `ssl.create_default_context(cafile=tmp/"tls"/"ca.pem")`. That also checks the host name. The image
+  needs `apk add openssl`. Claude Code connects when started with `NODE_EXTRA_CA_CERTS=<ca.pem>` and fails
+  without it (`claude mcp get <name>` shows the status without spending tokens).
+
 ## Hard-won lessons (don't regress these)
 - **Never publish `learn_ir_code: "OFF"`.** Zigbee2MQTT's zosung converter
   (`zigbee-herdsman-converters/src/lib/zosung.ts`, `tzZosung.zosung_learn_ir_code`) sends
@@ -117,6 +124,7 @@ worked:
 | 1.1.0 | Full-config AC devices → one HA `select`; config builder; `default_entity_id` |
 | 1.2.0 | Climate tab: regions, sensors, AC ladders, escalation, humidity priority split, HA entities |
 | 1.2.1 | Learning fix: never send `learn_ir_code: OFF`; timestamp-based capture detection; clearer errors |
+| 1.3.0 | Agent API: MCP over HTTPS on :8098 (own CA, hashed bearer token), tools for climate regions and IR buttons |
 
 Possible next steps (not requested yet): include regions in export/import; an HA `climate`
 entity per region; a real test suite (the fake-HA snippets above are a good start); detecting

@@ -102,6 +102,29 @@ data:
   payload: '{"ir_code_to_send": "<code>"}'
 ```
 
+## AI agents (Jarvis, Claude Code, …)
+AI agents can read and change your climate regions and press learned buttons through the app's **agent API**,
+an MCP server on port **8098** (HTTPS). For example, ask a voice assistant built on Claude Code (like
+telerouter's Jarvis) "set the bedroom to 23 degrees" or "turn the climate control off in the living room".
+
+1. **⚙ Settings → AI agents → Make a token.** Copy the token: it is shown only once (the app keeps only its
+   hash). *Make a new token* replaces it, and *Turn off* switches the API off.
+2. Give the agent the MCP address shown there (`https://<Home Assistant host>:8098/mcp`), the token as
+   `Authorization: Bearer <token>`, and the app's certificate. The API uses its own certificate authority
+   (the app makes it on first start). Pin the CA in the agent and compare its SHA-256 fingerprint with the one
+   shown in Settings. In telerouter: *Agents → Edit → Extra MCP servers → Add Zigbee IR Remote*, then
+   *Fetch & pin its certificate*.
+
+Tools: `climate_status` (regions, targets, readings, what the ACs do), `set_climate` (automatic control on/off,
+target temperature, target humidity, temperature priority), `list_remotes` (devices and learned controls) and
+`send_ir` (press a button or set a full-config AC).
+
+The certificate names the host's addresses, Home Assistant's internal and external URLs, `homeassistant.local`
+and `homeassistant`. If the agent uses another name, add it to the **Agent API host names** option and restart
+the app. The certificate is then re-issued, and the CA stays the same. The port can be changed or closed in
+the app's **Network** settings. Without a token every request is refused. Wrong tokens are throttled, and
+browsers (requests with an `Origin` header) are refused.
+
 ## Notes
 - Learned codes are read straight from the blaster's MQTT state (through Home
   Assistant's MQTT integration), so codes longer than Home Assistant's
@@ -120,3 +143,4 @@ data:
 | `learn_timeout` | `30` | Seconds to wait for a button press |
 | `expose_buttons` | `true` | Publish learned controls as HA button entities (or one select per full-config AC) |
 | `discovery_prefix` | `homeassistant` | MQTT discovery prefix |
+| `agent_api_hosts` | (empty) | Extra host names/addresses for the agent API's certificate, comma separated |

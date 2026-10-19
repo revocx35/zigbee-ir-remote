@@ -203,6 +203,30 @@ applies when a device is created, `assign_areas()` moves existing devices with
 `config/device_registry/update`. The editor's entity list (`Climate.entities`) hides entities
 whose unique_id starts with `irremote_region_`, so a region can't read its own average.
 
+### Agent API (MCP, `AgentAPI`, `AgentTLS`)
+A second aiohttp server on `AGENT_PORT` (8098, mapped in `config.yaml` `ports`) for AI agents, separate from the
+ingress UI. `POST /mcp` speaks MCP's Streamable HTTP transport with plain JSON responses (stateless):
+`initialize`, `ping`, `tools/list`, `tools/call`, notifications → 202. `GET /ca.pem` returns the CA (public, for
+pinning).
+
+- **Auth**: `Authorization: Bearer irr_…`. The token is made in the UI (`POST /api/agent/token`, accepted only
+  from the ingress proxy 172.30.32.2 when supervised), shown once, and stored as SHA-256 in
+  `store.data["agent_api"]`. Compared in constant time. With no token every request gets 401.
+  10 bad tokens per address in 5 min → 429. Requests with an `Origin` header are refused (no browsers, so no DNS
+  rebinding). Body ≤ 64 KiB.
+- **TLS**: `AgentTLS.ensure(names)` runs the `openssl` CLI (Alpine `openssl` package). It creates a P-256 CA once
+  (`/data/tls/ca.pem`, key 0600) and a server certificate for `names`, re-issued when the names change. The CA
+  stays, so a pinned agent keeps working. The server sends leaf + CA. `agent_names()` = option
+  `agent_api_hosts` + the hosts of HA's `internal_url`/`external_url` (`get_config`) + the host's addresses from
+  the Supervisor (`GET http://supervisor/network/info`, needs `hassio_api: true`) + `homeassistant.local`,
+  `homeassistant`.
+- **Tools**: `climate_status` (`_region_info`: targets, readings from `Climate._runtime`, status, ACs),
+  `set_climate` (through `Climate.update`, then save + entity sync + `publish_soon`, like the UI),
+  `list_remotes`, `send_ir` (`IRRemote.send_control`; notes when an enabled region controls that device).
+  Names are matched by `pick()`: id, then exact name, then a unique partial name, all after `slugify`.
+- Started in `initial_sync` after HA connects (the names need `get_config`). If it fails, the rest of the app
+  keeps running.
+
 ### HTTP API
 
 | Method & path | Purpose |
@@ -218,6 +242,7 @@ whose unique_id starts with `irremote_region_`, so a region can't read its own a
 | `GET /api/climate/status` | regions and live status (polled every 5 s by the UI) |
 | `POST/PUT/DELETE /api/regions[/{rid}]` | regions; `PUT` takes any partial set of fields |
 | `GET /api/export`, `POST /api/import` | backup of devices (regions are not included) |
+| `GET /api/agent`, `POST/DELETE /api/agent/token` | agent API state (URLs, CA fingerprint/PEM); make (shown once) or remove the token |
 
 ## Frontend (`app/static`)
 

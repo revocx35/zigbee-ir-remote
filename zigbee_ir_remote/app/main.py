@@ -13,15 +13,20 @@ running as an app) to:
 """
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import math
 import os
 import re
 import secrets
+import ssl
+import subprocess
 import time
 import unicodedata
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from aiohttp import ClientSession, WSMsgType, web
 
@@ -29,12 +34,14 @@ LOG = logging.getLogger("irremote")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 STATIC_DIR = Path(__file__).parent / "static"
 PORT = int(os.environ.get("PORT", "8099"))
+APP_VERSION = "1.3.0"  # keep in step with config.yaml
 
 DEFAULT_OPTIONS = {
     "z2m_base_topic": "zigbee2mqtt",
     "learn_timeout": 30,
     "expose_buttons": True,
     "discovery_prefix": "homeassistant",
+    "agent_api_hosts": "",
 }
 INVALID_STATES = {None, "", "unknown", "unavailable", "None"}
 # Messages arriving this soon after we enable learning are the blaster's
@@ -228,6 +235,7 @@ class IRRemote:
         self._blaster_cache = (0.0, [])
         self.learning = {}  # blaster_id -> {"cancel": Event, "device": .., "control": ..}
         self.climate = None  # set in main()
+        self.agent = None  # AgentAPI, set in main()
         self._sync_lock = asyncio.Lock()
 
     # ---------- blasters ----------
@@ -1195,6 +1203,346 @@ class Climate:
 
 # ---------------------------------------------------------------- HTTP API
 
+# ---------- agent API (MCP) ----------
+# AI agents (e.g. a Claude Code "Jarvis") control the remotes and climate regions through a small MCP
+# server on its own port. It needs a bearer token (made in the UI, only its hash is stored) and speaks
+# TLS with a certificate from the app's own CA, which the agent pins (GET /ca.pem shows it).
+AGENT_PORT = int(os.environ.get("AGENT_PORT", "8098"))
+TLS_DIR = DATA_DIR / "tls"
+MCP_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
+MCP_MAX_BODY = 64 * 1024
+AUTH_FAILS = (10, 300)  # at most 10 bad tokens per address in 5 minutes
+INGRESS_IP = "172.30.32.2"  # Home Assistant's ingress proxy
+MCP_INSTRUCTIONS = (
+    "Zigbee IR Remote controls infrared devices (ACs, TVs, fans...) through Zigbee IR blasters, and runs "
+    "'climate regions': rooms kept at a target temperature (and humidity) by stepping their ACs. Use "
+    "climate_status before changing a room; set_climate changes targets or turns a region's automatic control "
+    "on or off. list_remotes shows the learned buttons, send_ir presses one (or sets a full AC config).")
+
+
+def token_hash(token):
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def _openssl(*args):
+    subprocess.run(["openssl", *args], check=True, capture_output=True, timeout=60)
+
+
+class AgentTLS:
+    """A local CA (kept) and a server certificate for the names the agent may use (re-issued when they change)."""
+
+    def __init__(self, folder):
+        self.dir = folder
+        self.ca = folder / "ca.pem"
+        self.chain = folder / "server-chain.pem"
+        self.key = folder / "server.key"
+        self.names_file = folder / "names.json"
+
+    def ensure(self, names):
+        self.dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.dir, 0o700)
+        ca_key = self.dir / "ca.key"
+        if not self.ca.exists() or not ca_key.exists():
+            _openssl("req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes",
+                     "-keyout", str(ca_key), "-out", str(self.ca), "-days", "3650",
+                     "-subj", "/CN=Zigbee IR Remote CA " + secrets.token_hex(3),
+                     "-addext", "basicConstraints=critical,CA:TRUE",
+                     "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+                     "-addext", "subjectKeyIdentifier=hash")
+            self.names_file.unlink(missing_ok=True)
+        try:
+            old = json.loads(self.names_file.read_text())
+        except (OSError, ValueError):
+            old = None
+        if old == names and self.chain.exists() and self.key.exists():
+            return
+        csr, crt, ext = self.dir / "server.csr", self.dir / "server.pem", self.dir / "ext.cnf"
+        sans = ",".join(("IP:" if re.match(r"^[0-9.]+$|:", n) else "DNS:") + n for n in names)
+        ext.write_text(f"subjectAltName={sans}\nbasicConstraints=critical,CA:FALSE\n"
+                       "keyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\n"
+                       "subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n")
+        _openssl("req", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes",
+                 "-keyout", str(self.key), "-out", str(csr), "-subj", "/CN=" + names[0])
+        _openssl("x509", "-req", "-in", str(csr), "-CA", str(self.ca), "-CAkey", str(ca_key),
+                 "-set_serial", str(int.from_bytes(secrets.token_bytes(8), "big")), "-days", "825",
+                 "-out", str(crt), "-extfile", str(ext))
+        self.chain.write_text(crt.read_text() + self.ca.read_text())
+        for f in (ca_key, self.key):
+            os.chmod(f, 0o600)
+        for f in (csr, crt, ext):
+            f.unlink(missing_ok=True)
+        self.names_file.write_text(json.dumps(names))
+        LOG.info("Agent API certificate issued for %s", ", ".join(names))
+
+    def context(self):
+        ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(self.chain, self.key)
+        return ctx
+
+    def ca_pem(self):
+        return self.ca.read_text() if self.ca.exists() else ""
+
+    def fingerprint(self):
+        pem = self.ca_pem()
+        if not pem:
+            return ""
+        digest = hashlib.sha256(ssl.PEM_cert_to_DER_cert(pem)).hexdigest().upper()
+        return ":".join(digest[i:i + 2] for i in range(0, len(digest), 2))
+
+
+async def agent_names(remote):
+    """Host names and addresses the agent may use: the option, Home Assistant's URLs, the host's addresses."""
+    names = [n.strip() for n in str(remote.opts.get("agent_api_hosts") or "").split(",") if n.strip()]
+    try:
+        cfg = await remote.ha.call({"type": "get_config"})
+        for key in ("internal_url", "external_url"):
+            host = urlsplit(cfg.get(key) or "").hostname
+            if host:
+                names.append(host)
+    except HAError as err:
+        LOG.warning("Could not read Home Assistant's URLs: %s", err)
+    token = supervisor_token()
+    if token:
+        try:
+            async with ClientSession() as http:
+                async with http.get("http://supervisor/network/info", timeout=10,
+                                    headers={"Authorization": f"Bearer {token}"}) as res:
+                    info = (await res.json()).get("data") or {}
+            for iface in info.get("interfaces") or []:
+                for fam in ("ipv4", "ipv6"):
+                    for addr in ((iface.get(fam) or {}).get("address") or []):
+                        ip = addr.split("/")[0]
+                        if ip and not ip.lower().startswith("fe80"):
+                            names.append(ip)
+        except Exception as err:  # noqa: BLE001 - the option still works without it
+            LOG.warning("Could not read the host's addresses from the Supervisor: %s", err)
+    names += ["homeassistant.local", "homeassistant"]
+    clean = []
+    for n in names:
+        n = n.strip().strip("[]").lower()
+        if re.match(r"^[a-z0-9.:-]{1,253}$", n) and n not in clean:
+            clean.append(n)
+    return clean
+
+
+class ToolError(Exception):
+    pass
+
+
+def pick(items, ref, what, key="name"):
+    """An item by id, exact name, or a unique partial name (accents and case ignored)."""
+    if not items:
+        raise ToolError(f"there is no {what} yet")
+    ref = str(ref or "").strip()
+    if not ref:
+        if len(items) == 1:
+            return items[0]
+        raise ToolError(f"which {what}? " + ", ".join(i[key] for i in items))
+    norm = slugify(ref)
+    for test in (lambda i: i["id"] == ref, lambda i: slugify(i[key]) == norm, lambda i: norm in slugify(i[key])):
+        hits = [i for i in items if test(i)]
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            raise ToolError(f"'{ref}' matches several: " + ", ".join(i[key] for i in hits))
+    raise ToolError(f"no {what} '{ref}'; there are: " + ", ".join(i[key] for i in items))
+
+
+class AgentAPI:
+    def __init__(self, remote, tls):
+        self.remote = remote
+        self.store = remote.store
+        self.climate = remote.climate
+        self.tls = tls
+        self.fails = {}  # address -> [count, window start]
+        self.names = []
+        self.runner = None
+        self.tools = {
+            "climate_status": (self.climate_status, "The climate regions (rooms): automatic control on/off, "
+                               "target and current temperature/humidity, what the ACs are doing.", {}),
+            "set_climate": (self.set_climate, "Change a climate region: turn its automatic control on or off, set "
+                            "its target temperature or humidity, or how much each step favours temperature over "
+                            "humidity. Only pass what should change.", {
+                                "region": {"type": "string", "description": "region name or id (optional if there is one)"},
+                                "enabled": {"type": "boolean", "description": "automatic control on/off (off turns its ACs off)"},
+                                "target_temp": {"type": "number"},
+                                "target_humidity": {"type": "number", "description": "percent"},
+                                "temperature_priority": {"type": "number", "description": "0-100 % of each step for temperature"}}),
+            "list_remotes": (self.list_remotes, "The IR devices and their learned buttons (or, for full-config ACs, "
+                             "the configs like 'Cool 22° · Fan Auto').", {}),
+            "send_ir": (self.send_ir, "Press a learned IR button, or set a full-config AC to one of its configs.", {
+                "device": {"type": "string", "description": "device name or id"},
+                "control": {"type": "string", "description": "button or config name"}}),
+        }
+
+    @property
+    def token_hash(self):
+        return (self.store.data.get("agent_api") or {}).get("token_hash") or ""
+
+    # ---------- tools ----------
+    def _region_info(self, region):
+        rt = self.climate._runtime(region)
+        acs = []
+        for ac in region["acs"]:
+            info = {"name": self.climate._ac_name(ac)}
+            sent = (rt["sent"].get(ac["id"]) or {}).get("label")
+            if sent:
+                info["last_command"] = sent
+            acs.append(info)
+        out = {"id": region["id"], "name": region["name"],
+               "area": self.climate.areas.get(region.get("area_id")) or None,
+               "automatic_control": region["enabled"], "status": rt["status"],
+               "temperature": rt["temperature"], "target_temp": region["target_temp"],
+               "temp_tolerance": region["temp_tolerance"], "unit": self.climate.unit, "acs": acs}
+        if region.get("humidity_control"):
+            out.update(humidity=rt["humidity"], target_humidity=region["target_humidity"],
+                       humidity_tolerance=region["humidity_tolerance"], temperature_priority=region["importance"])
+        return out
+
+    async def climate_status(self):
+        return {"regions": [self._region_info(r) for r in self.climate.regions]}
+
+    async def set_climate(self, region="", enabled=None, target_temp=None, target_humidity=None,
+                          temperature_priority=None):
+        r = pick(self.climate.regions, region, "climate region")
+        data = {k: v for k, v in (("enabled", enabled), ("target_temp", target_temp),
+                                  ("target_humidity", target_humidity), ("importance", temperature_priority))
+                if v is not None}
+        if not data:
+            raise ToolError("nothing to change: pass enabled, target_temp, target_humidity or temperature_priority")
+        try:
+            self.climate.update(r, data)
+        except web.HTTPException as err:
+            raise ToolError(err.text) from None
+        self.store.save()
+        asyncio.ensure_future(self.remote.sync_entities())
+        self.climate.publish_soon(r)
+        LOG.info("Agent API: region %s changed: %s", r["name"], data)
+        return {"changed": data, "region": self._region_info(r)}
+
+    async def list_remotes(self):
+        out = []
+        for d in self.store.data["devices"]:
+            out.append({"id": d["id"], "name": d["name"],
+                        "kind": "full-config AC (each control is a whole AC state)" if d.get("kind") == "configs" else "buttons",
+                        "controls": [c["name"] + ("" if c.get("code") else " (not learned)") for c in d["controls"]]})
+        return {"devices": out}
+
+    async def send_ir(self, device, control):
+        dev = pick(self.store.data["devices"], device, "IR device")
+        ctl = pick(dev["controls"], control, f"control of {dev['name']}")
+        await self.remote.send_control(dev, ctl)
+        LOG.info("Agent API: sent %s / %s", dev["name"], ctl["name"])
+        res = {"sent": f"{dev['name']}: {ctl['name']}"}
+        users = [r["name"] for r in self.climate.regions if r["enabled"]
+                 and any(ac.get("device_id") == dev["id"] for ac in r["acs"])]
+        if users:
+            res["note"] = (f"the climate region {', '.join(users)} controls this device automatically and may change "
+                           "it again; use set_climate to change its target or turn it off instead")
+        return res
+
+    # ---------- MCP over HTTP ----------
+    def _throttled(self, ip):
+        n, start = self.fails.get(ip, (0, 0.0))
+        return n >= AUTH_FAILS[0] and time.monotonic() - start < AUTH_FAILS[1]
+
+    def _failed(self, ip):
+        n, start = self.fails.get(ip, (0, 0.0))
+        if time.monotonic() - start >= AUTH_FAILS[1]:
+            n, start = 0, time.monotonic()
+        self.fails[ip] = (n + 1, start)
+        if len(self.fails) > 1000:
+            self.fails.clear()
+
+    async def handle(self, request):
+        ip = request.remote or "?"
+        if request.headers.get("Origin"):
+            return web.json_response({"error": "browsers may not use this API"}, status=403)
+        if self._throttled(ip):
+            return web.json_response({"error": "too many attempts, try later"}, status=429)
+        auth = request.headers.get("Authorization", "")
+        tok = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
+        want = self.token_hash
+        if not want or not tok or not hmac.compare_digest(token_hash(tok), want):
+            self._failed(ip)
+            return web.json_response({"error": "unauthorized"}, status=401,
+                                     headers={"WWW-Authenticate": "Bearer"})
+        if request.content_length and request.content_length > MCP_MAX_BODY:
+            return web.json_response({"error": "request too large"}, status=413)
+        try:
+            msg = json.loads(await request.content.read(MCP_MAX_BODY + 1) or b"null")
+        except ValueError:
+            msg = None
+        if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0" or not isinstance(msg.get("method"), str):
+            return web.json_response({"jsonrpc": "2.0", "id": None,
+                                      "error": {"code": -32600, "message": "invalid request"}}, status=400)
+        if "id" not in msg:  # a notification
+            return web.Response(status=202)
+        result = await self.dispatch(msg["method"], msg.get("params") or {})
+        body = {"jsonrpc": "2.0", "id": msg["id"]}
+        body.update(result)
+        return web.json_response(body)
+
+    async def dispatch(self, method, params):
+        if method == "initialize":
+            want = params.get("protocolVersion")
+            return {"result": {"protocolVersion": want if want in MCP_VERSIONS else MCP_VERSIONS[0],
+                               "capabilities": {"tools": {"listChanged": False}},
+                               "serverInfo": {"name": "zigbee-ir-remote", "version": APP_VERSION},
+                               "instructions": MCP_INSTRUCTIONS}}
+        if method == "ping":
+            return {"result": {}}
+        if method == "tools/list":
+            return {"result": {"tools": [
+                {"name": name, "description": desc,
+                 "inputSchema": {"type": "object", "properties": props, "additionalProperties": False,
+                                 "required": ["device", "control"] if name == "send_ir" else []}}
+                for name, (_, desc, props) in self.tools.items()]}}
+        if method == "tools/call":
+            name, args = params.get("name"), params.get("arguments") or {}
+            tool = self.tools.get(name)
+            if not tool or not isinstance(args, dict) or any(k not in tool[2] for k in args):
+                return {"error": {"code": -32602, "message": f"unknown tool or arguments: {name}"}}
+            try:
+                out = await tool[0](**args)
+                return {"result": {"content": [{"type": "text", "text": json.dumps(out, ensure_ascii=False)}],
+                                   "isError": False}}
+            except (ToolError, HAError) as err:
+                return {"result": {"content": [{"type": "text", "text": str(err)}], "isError": True}}
+            except TypeError as err:
+                return {"result": {"content": [{"type": "text", "text": f"bad arguments: {err}"}], "isError": True}}
+        return {"error": {"code": -32601, "message": f"unknown method {method}"}}
+
+    async def ca(self, _):
+        return web.Response(text=self.tls.ca_pem(), content_type="application/x-pem-file")
+
+    def app(self):
+        app = web.Application(client_max_size=MCP_MAX_BODY)
+        app.router.add_post("/mcp", self.handle)
+        app.router.add_get("/ca.pem", self.ca)
+        return app
+
+    async def start(self):
+        """Serve the API (TLS) once the host names are known; called again when they may have changed."""
+        names = await agent_names(self.remote)
+        await asyncio.to_thread(self.tls.ensure, names)
+        self.names = names
+        if self.runner:
+            await self.runner.cleanup()
+        self.runner = web.AppRunner(self.app())
+        await self.runner.setup()
+        await web.TCPSite(self.runner, "0.0.0.0", AGENT_PORT, ssl_context=self.tls.context()).start()
+        LOG.info("Agent API (MCP) listening on port %d (TLS)%s", AGENT_PORT,
+                 "" if self.token_hash else "; no token yet, make one under Settings")
+
+    def info(self):
+        return {"enabled": bool(self.token_hash), "created": (self.store.data.get("agent_api") or {}).get("created"),
+                "port": AGENT_PORT, "running": self.runner is not None,
+                "urls": [f"https://{('[' + n + ']') if ':' in n else n}:{AGENT_PORT}/mcp" for n in self.names],
+                "ca_fingerprint": self.tls.fingerprint(), "ca_pem": self.tls.ca_pem()}
+
+
 def ha_errors(handler):
     async def wrapper(request):
         try:
@@ -1239,6 +1587,33 @@ def make_app(remote: IRRemote):
             return
         if any(c["name"] == name and c["id"] != ctl_id for c in dev["controls"]):
             raise web.HTTPConflict(text=f"There is already a config named “{name}”")
+
+    # --- agent API (MCP): token and certificate for AI agents
+    def ingress_only(request):
+        """Tokens are made through the HA sidebar (ingress) only, not by other containers on the network."""
+        if supervisor_token() and request.remote != INGRESS_IP:
+            raise web.HTTPForbidden(text="Only from the app's page in Home Assistant")
+
+    @routes.get("/api/agent")
+    async def agent_info(_):
+        return web.json_response(remote.agent.info() if remote.agent else {"enabled": False, "running": False})
+
+    @routes.post("/api/agent/token")
+    async def agent_token(request):
+        ingress_only(request)
+        token = "irr_" + secrets.token_urlsafe(32)
+        store.data["agent_api"] = {"token_hash": token_hash(token), "created": time.time()}
+        store.save()
+        LOG.info("Agent API: a new token was made (the old one no longer works)")
+        return web.json_response({"token": token, **(remote.agent.info() if remote.agent else {})})
+
+    @routes.delete("/api/agent/token")
+    async def agent_token_delete(request):
+        ingress_only(request)
+        store.data.pop("agent_api", None)
+        store.save()
+        LOG.info("Agent API: token removed, the API is off")
+        return web.json_response({"ok": True})
 
     @routes.get("/")
     async def index(_):
@@ -1547,6 +1922,7 @@ async def main():
     ha = HAClient(ws_url, token)
     remote = IRRemote(ha, Store(DATA_DIR / "remotes.json"), options)
     remote.climate = Climate(remote)
+    remote.agent = AgentAPI(remote, AgentTLS(TLS_DIR))
     ha_task = asyncio.create_task(ha.run())
 
     async def initial_sync():
@@ -1555,6 +1931,10 @@ async def main():
             await remote.climate.load_meta()  # areas are needed for the region devices
         except HAError as err:
             LOG.warning("Could not load Home Assistant areas: %s", err)
+        try:
+            await remote.agent.start()
+        except Exception:  # noqa: BLE001 - the rest of the app works without it
+            LOG.exception("Could not start the agent API")
         await remote.sync_entities()
     asyncio.create_task(initial_sync())
     climate_task = asyncio.create_task(remote.climate.run())
@@ -1568,6 +1948,8 @@ async def main():
     finally:
         climate_task.cancel()
         await runner.cleanup()
+        if remote.agent.runner:
+            await remote.agent.runner.cleanup()
 
 
 if __name__ == "__main__":
