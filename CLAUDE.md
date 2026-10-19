@@ -125,6 +125,7 @@ worked:
 | 1.2.0 | Climate tab: regions, sensors, AC ladders, escalation, humidity priority split, HA entities |
 | 1.2.1 | Learning fix: never send `learn_ir_code: OFF`; timestamp-based capture detection; clearer errors |
 | 1.3.0 | Agent API: MCP over HTTPS on :8098 (own CA, hashed bearer token), tools for climate regions and IR buttons |
+| 1.3.1 | Agent API certificate: IPv6 addresses as IP entries |
 
 Possible next steps (not requested yet): include regions in export/import; an HA `climate`
 entity per region; a real test suite (the fake-HA snippets above are a good start); detecting

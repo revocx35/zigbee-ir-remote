@@ -34,7 +34,7 @@ LOG = logging.getLogger("irremote")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 STATIC_DIR = Path(__file__).parent / "static"
 PORT = int(os.environ.get("PORT", "8099"))
-APP_VERSION = "1.3.0"  # keep in step with config.yaml
+APP_VERSION = "1.3.1"  # keep in step with config.yaml
 
 DEFAULT_OPTIONS = {
     "z2m_base_topic": "zigbee2mqtt",
@@ -1257,7 +1257,7 @@ class AgentTLS:
         if old == names and self.chain.exists() and self.key.exists():
             return
         csr, crt, ext = self.dir / "server.csr", self.dir / "server.pem", self.dir / "ext.cnf"
-        sans = ",".join(("IP:" if re.match(r"^[0-9.]+$|:", n) else "DNS:") + n for n in names)
+        sans = ",".join(("IP:" if re.fullmatch(r"[0-9.]+", n) or ":" in n else "DNS:") + n for n in names)
         ext.write_text(f"subjectAltName={sans}\nbasicConstraints=critical,CA:FALSE\n"
                        "keyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\n"
                        "subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n")

@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.3.1
+- Agent API certificate: IPv6 addresses are now IP entries (they were written as DNS names).
+
 ## 1.3.0
 - **Agent API for AI agents** (e.g. telerouter's Jarvis on Claude Code): an MCP server on port 8098 (HTTPS)
   with the tools `climate_status`, `set_climate`, `list_remotes` and `send_ir`. Turn it on under
