@@ -147,7 +147,10 @@ class HAClient:
         elif msg.get("type") == "event":
             cb = self._subs.get(mid)
             if cb:
-                cb(msg.get("event"))
+                try:
+                    cb(msg.get("event"))
+                except Exception:  # noqa: BLE001 - one bad event must not drop the connection
+                    LOG.exception("Error handling a Home Assistant event")
 
     async def call(self, payload, callback=None, timeout=15):
         try:
