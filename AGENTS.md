@@ -8,5 +8,7 @@ real Home Assistant, hard-won lessons, behaviour decisions agreed with the owner
 Short version: one add-on in `zigbee_ir_remote/` (Python `app/main.py` with aiohttp only, vanilla JS in
 `app/static/`, no build step). Pushing to `main` is a release, so bump `version:` in `config.yaml` and
 `APP_VERSION` in `main.py`, and update `CHANGELOG.md` and `DOCS.md`. Check with
-`python3 -m py_compile zigbee_ir_remote/app/main.py` and `node --check zigbee_ir_remote/app/static/app.js`.
+`python3 -m py_compile zigbee_ir_remote/app/main.py`, `node --check zigbee_ir_remote/app/static/app.js` and
+`PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider tests` (needs `aiohttp`, `pytest`; fake HA in
+`tests/conftest.py`). Never remove the ingress-only middleware in `make_app` (the UI API has no auth of its own).
 Never commit `data/`, tokens or certificates.

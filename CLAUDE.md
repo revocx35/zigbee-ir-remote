@@ -31,8 +31,9 @@ There is no build step, no npm, and no framework.
   `py_compile` with `PYTHONDONTWRITEBYTECODE=1`, or delete `app/__pycache__` afterwards.
 
 ## Running and testing
-There is no real Home Assistant in the dev environment and no automated test suite. What has
-worked:
+There is no real Home Assistant in the dev environment. A small pytest suite lives in `tests/`
+(`conftest.py` has the fake HA below; needs `aiohttp` and `pytest`):
+`PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider tests`. What else has worked:
 
 - **Syntax**: `python3 -m py_compile zigbee_ir_remote/app/main.py` and
   `node --check zigbee_ir_remote/app/static/app.js`.
@@ -101,6 +102,9 @@ worked:
   Long-lived subscribers (`Climate._prepare`) must detect this and resubscribe.
 - **Don't feed a region its own output**: `Climate.entities()` hides entities whose unique_id
   starts with `irremote_region_`.
+- **The UI API has no login of its own**: HA's ingress authenticates. When supervised, `make_app`'s
+  middleware refuses every source but the ingress proxy (`INGRESS_IP`), because port 8099 is reachable from
+  every container on the Supervisor network. Keep it that way.
 - The Climate loop deliberately waits about 0.5 s after `subscribe_entities` so the initial
   snapshot arrives before any decision. Otherwise missing readings look like "no sensor data"
   and the ACs get switched off.
@@ -126,6 +130,7 @@ worked:
 | 1.2.1 | Learning fix: never send `learn_ir_code: OFF`; timestamp-based capture detection; clearer errors |
 | 1.3.0 | Agent API: MCP over HTTPS on :8098 (own CA, hashed bearer token), tools for climate regions and IR buttons |
 | 1.3.1 | Agent API certificate: IPv6 addresses as IP entries |
+| 1.3.2 | UI API only from the ingress proxy; agent API body/params fixes; event callbacks can't drop the HA link |
 
 Possible next steps (not requested yet): include regions in export/import; an HA `climate`
 entity per region; a real test suite (the fake-HA snippets above are a good start); detecting

@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.2
+- Security: the app's own web API (port 8099) now only answers Home Assistant's ingress proxy. Other
+  containers on the Supervisor network could send IR codes and change climate regions without a login.
+- Agent API: requests that arrive in several chunks are read whole (they were refused as invalid JSON),
+  and `params` that are not an object get a JSON-RPC error instead of a server error.
+- One malformed Home Assistant event no longer drops the connection (and a running learn session).
+- Deleting a climate region while it was being controlled could leave its retained state in MQTT.
+
 ## 1.3.1
 - Agent API certificate: IPv6 addresses are now IP entries (they were written as DNS names).
 

@@ -34,7 +34,7 @@ LOG = logging.getLogger("irremote")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 STATIC_DIR = Path(__file__).parent / "static"
 PORT = int(os.environ.get("PORT", "8099"))
-APP_VERSION = "1.3.1"  # keep in step with config.yaml
+APP_VERSION = "1.3.2"  # keep in step with config.yaml
 
 DEFAULT_OPTIONS = {
     "z2m_base_topic": "zigbee2mqtt",

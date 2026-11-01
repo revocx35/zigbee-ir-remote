@@ -45,6 +45,7 @@ Assistant's `mqtt.publish` service and **subscribes** through the websocket comm
 | `zigbee_ir_remote/CHANGELOG.md` | Release notes (shown by HA on update) |
 | `zigbee_ir_remote/app/main.py` | The whole backend (single file, sections below) |
 | `zigbee_ir_remote/app/static/*` | The whole frontend (no build step, no dependencies) |
+| `tests/` | pytest suite with a fake HA (`conftest.py`): ingress guard, agent API, HA client, climate loop |
 
 ## Backend (`app/main.py`)
 
@@ -57,7 +58,7 @@ Sections, top to bottom:
 | `Store` | JSON persistence of `/data/remotes.json` (atomic write via `.tmp` + rename). |
 | `IRRemote` | Blaster discovery, learning, sending, and MQTT discovery sync (`sync_entities`). |
 | climate section (`Climate`, `clean_ac`, `clean_step`, `name_temperature`) | Region validation, the control loop, and region entities. |
-| `make_app` | aiohttp routes (`/api/*`) plus static files. `changed()` = save + background `sync_entities()`. |
+| `make_app` | aiohttp routes (`/api/*`) plus static files. `changed()` = save + background `sync_entities()`. When supervised, a middleware answers 403 to anything but the ingress proxy (172.30.32.2): the UI API has no login of its own. |
 | `supervisor_token`, `main` | Token from env or `/run/s6/container_environment` (s6 hides it from the env). Starts `HAClient.run`, the initial sync, `Climate.run` and the web server on port 8099. |
 
 ### Home Assistant websocket calls used
