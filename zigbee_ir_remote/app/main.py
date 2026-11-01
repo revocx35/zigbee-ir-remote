@@ -1471,7 +1471,13 @@ class AgentAPI:
         if request.content_length and request.content_length > MCP_MAX_BODY:
             return web.json_response({"error": "request too large"}, status=413)
         try:
-            msg = json.loads(await request.content.read(MCP_MAX_BODY + 1) or b"null")
+            # read() waits for the whole body (content.read(n) may return only the first chunk)
+            # and refuses more than client_max_size.
+            raw = await request.read()
+        except web.HTTPRequestEntityTooLarge:
+            return web.json_response({"error": "request too large"}, status=413)
+        try:
+            msg = json.loads(raw or b"null")
         except ValueError:
             msg = None
         if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0" or not isinstance(msg.get("method"), str):
