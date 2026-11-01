@@ -1485,7 +1485,11 @@ class AgentAPI:
                                       "error": {"code": -32600, "message": "invalid request"}}, status=400)
         if "id" not in msg:  # a notification
             return web.Response(status=202)
-        result = await self.dispatch(msg["method"], msg.get("params") or {})
+        params = msg.get("params") or {}
+        if not isinstance(params, dict):
+            return web.json_response({"jsonrpc": "2.0", "id": msg["id"],
+                                      "error": {"code": -32602, "message": "params must be an object"}}, status=400)
+        result = await self.dispatch(msg["method"], params)
         body = {"jsonrpc": "2.0", "id": msg["id"]}
         body.update(result)
         return web.json_response(body)
