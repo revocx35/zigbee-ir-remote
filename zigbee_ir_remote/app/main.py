@@ -1886,7 +1886,16 @@ def make_app(remote: IRRemote):
         changed()
         return web.json_response({"imported": count})
 
-    app = web.Application(client_max_size=10 * 1024 ** 2)
+    @web.middleware
+    async def ingress_guard(request, handler):
+        # Port 8099 is reachable by every container on the Supervisor's network, not only by
+        # the ingress proxy, and the UI API has no login of its own (HA's ingress does that).
+        if supervised and request.remote != INGRESS_IP:
+            return web.Response(status=403, text="Only through Home Assistant (ingress)")
+        return await handler(request)
+
+    supervised = bool(supervisor_token())
+    app = web.Application(client_max_size=10 * 1024 ** 2, middlewares=[ingress_guard])
     app.add_routes(routes)
     app.router.add_static("/static/", STATIC_DIR)
     return app
