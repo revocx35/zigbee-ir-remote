@@ -817,7 +817,8 @@ class Climate:
                         continue
                     try:
                         await self._tick(region, time.time())
-                        await self.publish_state(region)
+                        if region in self.regions:  # not deleted during the tick (remove() cleared its state)
+                            await self.publish_state(region)
                     except HAError as err:
                         LOG.warning("Climate %s: %s", region["name"], err)
             except HAError as err:
